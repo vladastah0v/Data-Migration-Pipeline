@@ -3,6 +3,7 @@ import json
 import sys
 from time import perf_counter
 from typing import Annotated
+from uuid import UUID
 
 import typer
 from alembic.util import CommandError
@@ -10,7 +11,7 @@ from asyncpg import InterfaceError, PostgresError
 from pydantic import BaseModel, ValidationError
 from pydantic_settings import SettingsError
 from rich.console import Console
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskID, TextColumn
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TaskID, TextColumn
 from rich.table import Table
 from rich.text import Text
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
@@ -19,11 +20,21 @@ from migration_pipeline.config import (
     DatabaseSettings,
     DatabaseSide,
     LegacyAdminSettings,
+    LegacySettings,
     SchemaSettings,
     Settings,
 )
 from migration_pipeline.database.connections import POSTGRES_MAJOR, read_server_version
+from migration_pipeline.database.legacy import LegacySourceError, open_legacy_source
 from migration_pipeline.database.schema import upgrade_schema
+from migration_pipeline.extractors.base import (
+    BIGINT_MAX,
+    BIGINT_MIN,
+    LegacyEntity,
+    extract_batches,
+)
+from migration_pipeline.extractors.base import DEFAULT_BATCH_SIZE as DEFAULT_EXTRACT_BATCH_SIZE
+from migration_pipeline.extractors.base import MAX_BATCH_SIZE as MAX_EXTRACT_BATCH_SIZE
 from migration_pipeline.seeding.data import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_SEED,
@@ -108,7 +119,7 @@ def seed(
     )
     settings = _load_settings(LegacyAdminSettings)
     start = perf_counter()
-    _seed_event(
+    _cli_event(
         "seed_started",
         profile=profile.value,
         seed=options.seed,
@@ -134,11 +145,11 @@ def seed(
         try:
             result = asyncio.run(seed_legacy(settings, options, update_progress))
         except SeedError as exc:
-            _seed_event("seed_failed", reason=type(exc).__name__)
+            _cli_event("seed_failed", reason=type(exc).__name__)
             error_console.print(str(exc), style="red", markup=False)
             raise typer.Exit(code=1) from exc
         except (OSError, SQLAlchemyError, PostgresError, InterfaceError, CommandError) as exc:
-            _seed_event("seed_failed", reason=type(exc).__name__)
+            _cli_event("seed_failed", reason=type(exc).__name__)
             error_console.print(_database_error(exc), style="red", markup=False)
             raise typer.Exit(code=1) from exc
 
@@ -147,7 +158,7 @@ def seed(
         table.add_row(entry.name, str(entry.rows), str(entry.invalid_rows))
     console.print(table)
     console.print(f"Зафиксирован снимок {result.snapshot_id}")
-    _seed_event(
+    _cli_event(
         "seed_completed",
         snapshot_id=str(result.snapshot_id),
         counts={entry.name: entry.rows for entry in result.tables},
@@ -157,7 +168,89 @@ def seed(
     )
 
 
-def _seed_event(event: str, **fields: object) -> None:
+@app.command()
+def extract(
+    entity: Annotated[LegacyEntity, typer.Option(help="Сущность источника для чтения.")],
+    batch_size: Annotated[
+        int,
+        typer.Option(min=1, max=MAX_EXTRACT_BATCH_SIZE, help="Максимум строк в партии."),
+    ] = DEFAULT_EXTRACT_BATCH_SIZE,
+    after_id: Annotated[
+        int | None,
+        typer.Option(min=BIGINT_MIN, max=BIGINT_MAX, help="Последний уже обработанный ID."),
+    ] = None,
+    snapshot_id: Annotated[
+        UUID | None,
+        typer.Option(help="Ожидаемый UUID зафиксированного снимка legacy."),
+    ] = None,
+) -> None:
+    """Прочитать сущность из снимка legacy и показать сводку чтения."""
+    settings = _load_settings(LegacySettings)
+    _cli_event(
+        "extract_started",
+        entity_type=entity.value,
+        batch_size=batch_size,
+        after_id=after_id,
+        expected_snapshot_id=str(snapshot_id) if snapshot_id is not None else None,
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description} — строк: {task.completed:.0f}"),
+        console=console,
+        disable=not console.is_terminal,
+        redirect_stderr=False,
+    ) as progress:
+        try:
+            actual_id, batches, records, last_id = asyncio.run(
+                _inspect_extraction(settings, entity, batch_size, after_id, snapshot_id, progress)
+            )
+        except (LegacySourceError, OSError, SQLAlchemyError, PostgresError, InterfaceError) as exc:
+            _cli_event("extract_failed", entity_type=entity.value, reason=type(exc).__name__)
+            message = str(exc) if isinstance(exc, LegacySourceError) else _database_error(exc)
+            error_console.print(message, style="red", markup=False)
+            raise typer.Exit(code=1) from exc
+
+    table = Table("Сущность", "Партий", "Строк", "Последний ID", title="Чтение legacy")
+    table.add_row(
+        entity.value, str(batches), str(records), str(last_id) if last_id is not None else "—"
+    )
+    console.print(table)
+    console.print(f"Снимок {actual_id}")
+    _cli_event(
+        "extract_completed",
+        entity_type=entity.value,
+        snapshot_id=str(actual_id),
+        batches=batches,
+        records_extracted=records,
+        last_processed_id=last_id,
+    )
+
+
+async def _inspect_extraction(
+    settings: LegacySettings,
+    entity: LegacyEntity,
+    batch_size: int,
+    after_id: int | None,
+    snapshot_id: UUID | None,
+    progress: Progress,
+) -> tuple[UUID, int, int, int | None]:
+    batches = records = 0
+    last_id = None
+    async with open_legacy_source(settings, expected_snapshot_id=snapshot_id) as source:
+        task = progress.add_task(entity.value, total=None)
+        async for batch in extract_batches(
+            source, entity, batch_size=batch_size, after_id=after_id
+        ):
+            batches += 1
+            records += len(batch.rows)
+            last_id = batch.last_id
+            progress.update(task, advance=len(batch.rows))
+            _cli_event("extract_batch", snapshot_id=str(source.snapshot.id), **batch.log_fields())
+        return source.snapshot.id, batches, records, last_id
+
+
+def _cli_event(event: str, **fields: object) -> None:
     print(json.dumps({"event": event, **fields}, ensure_ascii=False), file=sys.stderr)
 
 

@@ -1,6 +1,6 @@
 import os
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -14,8 +14,21 @@ from sqlalchemy.sql import Executable
 
 from migration_pipeline.config import DatabaseSettings, SchemaSettings
 from migration_pipeline.database.connections import create_database_engine, read_server_version
+from migration_pipeline.database.legacy import (
+    LegacySource,
+    LegacySourceError,
+    open_legacy_source,
+    read_source_snapshot,
+)
 from migration_pipeline.database.schema import revision_config, upgrade_schema
-from migration_pipeline.models.legacy import LegacyCustomer, LegacyOrder, LegacySourceSnapshot
+from migration_pipeline.extractors.base import BIGINT_MAX, BIGINT_MIN, LegacyEntity, extract_batches
+from migration_pipeline.models.legacy import (
+    LegacyCustomer,
+    LegacyOrder,
+    LegacyPayment,
+    LegacySourceSnapshot,
+    LegacyStatusHistory,
+)
 from migration_pipeline.models.migration import MigrationBatch, MigrationCheckpoint, MigrationRun
 from migration_pipeline.models.target import (
     Address,
@@ -209,6 +222,105 @@ async def test_seed_preserves_existing_data(settings: SchemaSettings, legacy_id:
 
         assert await conn.scalar(select(LegacyCustomer.legacy_id)) == legacy_id
         assert await conn.scalar(select(LegacySourceSnapshot.snapshot_id)) is None
+
+
+async def test_open_source_rejects_an_unsealed_database(settings: SchemaSettings) -> None:
+    with pytest.raises(LegacySourceError, match="ещё не зафиксирован"):
+        async with open_legacy_source(settings):
+            pytest.fail("Открытый снимок недоступен для извлечения.")
+
+
+async def test_extract_resumes_across_sparse_signed_ids(
+    settings: SchemaSettings, caplog: pytest.LogCaptureFixture
+) -> None:
+    now = datetime.now(UTC)
+    keys = [BIGINT_MIN, -7, 0, 41, BIGINT_MAX]
+    caplog.set_level("INFO", logger="migration_pipeline.extractors.base")
+
+    async with transaction(settings.legacy_admin_database, settings.db_timeout_seconds) as conn:
+        await conn.execute(
+            insert(LegacyCustomer),
+            [
+                {"legacy_id": key, "created_at": now, "updated_at": now, "extra_data": {"raw": key}}
+                for key in reversed(keys)
+            ],
+        )
+        await conn.execute(SEAL_SOURCE)
+        source = LegacySource(conn, await read_source_snapshot(conn))
+
+        async with aclosing(
+            extract_batches(source, LegacyEntity.CUSTOMERS, batch_size=2)
+        ) as batches:
+            first = await anext(batches)
+        assert (first.first_id, first.last_id, len(first.rows)) == (BIGINT_MIN, -7, 2)
+        assert first.rows[0]["extra_data"] == {"raw": BIGINT_MIN}
+        resumed = [
+            batch
+            async for batch in extract_batches(
+                source,
+                LegacyEntity.CUSTOMERS,
+                batch_size=2,
+                after_id=first.last_id,
+                start_batch_number=first.number + 1,
+            )
+        ]
+        assert [(batch.number, batch.first_id, batch.last_id) for batch in resumed] == [
+            (2, 0, 41),
+            (3, BIGINT_MAX, BIGINT_MAX),
+        ]
+        assert [row["legacy_id"] for batch in (first, *resumed) for row in batch.rows] == keys
+        assert [
+            row["legacy_id"]
+            async for batch in extract_batches(source, LegacyEntity.CUSTOMERS, after_id=0)
+            for row in batch.rows
+        ] == [41, BIGINT_MAX]
+        assert [
+            batch
+            async for batch in extract_batches(source, LegacyEntity.CUSTOMERS, after_id=BIGINT_MAX)
+        ] == []
+
+    first_log = next(record for record in caplog.records if record.message == "extract_batch")
+    assert first_log.entity_type == "customers"
+    assert first_log.batch_number == 1
+    assert first_log.records_extracted == 2
+    assert first_log.last_processed_id == -7
+    assert first_log.extraction_duration_seconds >= 0
+
+
+async def test_extract_uses_each_entity_primary_key_and_checks_snapshot(
+    settings: SchemaSettings, legacy_id: int
+) -> None:
+    now = datetime.now(UTC)
+    async with transaction(settings.legacy_admin_database, settings.db_timeout_seconds) as conn:
+        await conn.execute(
+            insert(LegacyCustomer).values(legacy_id=legacy_id, created_at=now, updated_at=now)
+        )
+        await conn.execute(
+            insert(LegacyOrder).values(
+                legacy_order_id=legacy_id + 1,
+                customer_legacy_id=legacy_id,
+                created_at=now,
+            )
+        )
+        await conn.execute(
+            insert(LegacyPayment).values(
+                legacy_payment_id=legacy_id + 2,
+                legacy_order_id=legacy_id + 1,
+            )
+        )
+        await conn.execute(
+            insert(LegacyStatusHistory).values(id=legacy_id + 3, legacy_order_id=legacy_id + 1)
+        )
+        snapshot_id = await conn.scalar(SEAL_SOURCE)
+        with pytest.raises(LegacySourceError, match="UUID снимка legacy изменился"):
+            await read_source_snapshot(conn, expected_id=uuid4())
+        snapshot = await read_source_snapshot(conn, expected_id=snapshot_id)
+        source = LegacySource(conn, snapshot)
+
+        for offset, entity in enumerate(LegacyEntity):
+            assert [page.last_id async for page in extract_batches(source, entity)] == [
+                legacy_id + offset
+            ]
 
 
 async def test_normalized_customer_keys_deduplicate_within_one_customer(

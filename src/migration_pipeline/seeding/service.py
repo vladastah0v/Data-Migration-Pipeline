@@ -3,13 +3,13 @@ from dataclasses import dataclass
 from itertools import islice
 from uuid import UUID
 
-from alembic.script import ScriptDirectory
 from sqlalchemy import exists, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from migration_pipeline.config import LegacyAdminSettings
-from migration_pipeline.database.connections import POSTGRES_MAJOR, create_database_engine
-from migration_pipeline.database.schema import SCHEMA_LOCK_KEY, revision_config
+from migration_pipeline.database.connections import create_database_engine
+from migration_pipeline.database.legacy import LegacySourceError, require_legacy_schema
+from migration_pipeline.database.schema import SCHEMA_LOCK_KEY
 from migration_pipeline.models.legacy import LegacySourceSnapshot
 from migration_pipeline.seeding.data import LegacyDataGenerator, SeedOptions, SourceRows
 
@@ -82,19 +82,13 @@ async def _seed_source(
 
 
 async def _require_open_source(connection: AsyncConnection, tables: tuple[SourceRows, ...]) -> None:
-    if connection.dialect.server_version_info[0] != POSTGRES_MAJOR:
-        raise SeedError(f"Для генерации требуется PostgreSQL {POSTGRES_MAJOR}.")
     await connection.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": SCHEMA_LOCK_KEY}
     )
-    if await connection.scalar(text("SELECT to_regclass('public.alembic_version')")) is None:
-        raise SeedError("Схема legacy отсутствует. Выполните migration-pipeline init.")
-    installed = frozenset(
-        await connection.scalars(text("SELECT version_num FROM public.alembic_version"))
-    )
-    expected = frozenset(ScriptDirectory.from_config(revision_config("legacy")).get_heads())
-    if installed != expected:
-        raise SeedError("Схема legacy требует обновления. Выполните migration-pipeline init.")
+    try:
+        await require_legacy_schema(connection)
+    except LegacySourceError as exc:
+        raise SeedError(str(exc)) from exc
 
     snapshot = await connection.execute(
         select(LegacySourceSnapshot.snapshot_id)

@@ -136,3 +136,20 @@ def test_seed_reports_a_sealed_source(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 1
     assert '"event": "seed_failed"' in result.stderr
     assert "Снимок legacy уже зафиксирован." in result.stderr
+
+
+@pytest.mark.usefixtures("isolated_environment")
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--batch-size", "10001"],
+        ["--after-id", "-9223372036854775809"],
+        ["--after-id", "9223372036854775808"],
+        ["--snapshot-id", "no-uuid"],
+    ],
+)
+def test_extract_validates_options_before_reading_settings(arguments: list[str]) -> None:
+    result = runner.invoke(cli.app, ["extract", "--entity", "customers", *arguments])
+
+    assert result.exit_code == 2
+    assert "legacy_db" not in result.output
