@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "data-migration-pipeline"
+version = "0.1.0"
+description = "Система пакетной миграции данных между базами PostgreSQL"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.14,<2",
+    "asyncpg>=0.30,<1",
+    "faker>=30",
+    "psutil>=6,<8",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    "rich>=13,<16",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "typer>=0.16,<1",
+]
+
+[project.scripts]
+migration-pipeline = "migration_pipeline.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.25,<2",
+    "pytest-cov>=6,<8",
+    "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/migration_pipeline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]

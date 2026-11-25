@@ -1,0 +1,66 @@
+x-postgres: &postgres
+  build:
+    context: ./infra/postgres
+  healthcheck:
+    test: ["CMD-SHELL", 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+    interval: 3s
+    timeout: 3s
+    retries: 20
+    start_period: 5s
+
+services:
+  legacy-db:
+    <<: *postgres
+    environment:
+      POSTGRES_DB: ${LEGACY_DB__NAME:?Укажите LEGACY_DB__NAME в .env}
+      POSTGRES_USER: ${LEGACY_DB_ADMIN_USER:?Укажите LEGACY_DB_ADMIN_USER в .env}
+      POSTGRES_PASSWORD: ${LEGACY_DB_ADMIN_PASSWORD:?Укажите LEGACY_DB_ADMIN_PASSWORD в .env}
+      POSTGRES_INITDB_ARGS: "--auth-local=scram-sha-256 --auth-host=scram-sha-256"
+      MIGRATION_DB_ROLE: ${LEGACY_DB__USER:?Укажите LEGACY_DB__USER в .env}
+      MIGRATION_DB_PASSWORD: ${LEGACY_DB__PASSWORD:?Укажите LEGACY_DB__PASSWORD в .env}
+      MIGRATION_DB_ACCESS: read
+    ports:
+      - "127.0.0.1:${LEGACY_DB__PORT:-55432}:5432"
+    volumes:
+      - legacy-data:/var/lib/postgresql/data
+
+  target-db:
+    <<: *postgres
+    environment:
+      POSTGRES_DB: ${TARGET_DB__NAME:?Укажите TARGET_DB__NAME в .env}
+      POSTGRES_USER: ${TARGET_DB_ADMIN_USER:?Укажите TARGET_DB_ADMIN_USER в .env}
+      POSTGRES_PASSWORD: ${TARGET_DB_ADMIN_PASSWORD:?Укажите TARGET_DB_ADMIN_PASSWORD в .env}
+      POSTGRES_INITDB_ARGS: "--auth-local=scram-sha-256 --auth-host=scram-sha-256"
+      MIGRATION_DB_ROLE: ${TARGET_DB__USER:?Укажите TARGET_DB__USER в .env}
+      MIGRATION_DB_PASSWORD: ${TARGET_DB__PASSWORD:?Укажите TARGET_DB__PASSWORD в .env}
+      MIGRATION_DB_ACCESS: write
+    ports:
+      - "127.0.0.1:${TARGET_DB__PORT:-55433}:5432"
+    volumes:
+      - target-data:/var/lib/postgresql/data
+
+  migration-runner:
+    build:
+      context: .
+    profiles: [tools]
+    depends_on:
+      legacy-db:
+        condition: service_healthy
+      target-db:
+        condition: service_healthy
+    environment:
+      LEGACY_DB__HOST: legacy-db
+      LEGACY_DB__PORT: "5432"
+      LEGACY_DB__NAME: ${LEGACY_DB__NAME:?Укажите LEGACY_DB__NAME в .env}
+      LEGACY_DB__USER: ${LEGACY_DB__USER:?Укажите LEGACY_DB__USER в .env}
+      LEGACY_DB__PASSWORD: ${LEGACY_DB__PASSWORD:?Укажите LEGACY_DB__PASSWORD в .env}
+      TARGET_DB__HOST: target-db
+      TARGET_DB__PORT: "5432"
+      TARGET_DB__NAME: ${TARGET_DB__NAME:?Укажите TARGET_DB__NAME в .env}
+      TARGET_DB__USER: ${TARGET_DB__USER:?Укажите TARGET_DB__USER в .env}
+      TARGET_DB__PASSWORD: ${TARGET_DB__PASSWORD:?Укажите TARGET_DB__PASSWORD в .env}
+      DB_TIMEOUT_SECONDS: ${DB_TIMEOUT_SECONDS:-5}
+
+volumes:
+  legacy-data:
+  target-data:
