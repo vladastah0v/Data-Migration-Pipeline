@@ -1,10 +1,12 @@
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, Field, SecretStr, StringConstraints, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import URL
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+RequiredPassword = Annotated[SecretStr, Field(min_length=1)]
+type DatabaseSide = Literal["legacy", "target"]
 
 
 class DatabaseSettings(BaseModel):
@@ -12,7 +14,7 @@ class DatabaseSettings(BaseModel):
     port: Annotated[int, Field(ge=1, le=65535)]
     name: NonEmptyText
     user: NonEmptyText
-    password: Annotated[SecretStr, Field(min_length=1)]
+    password: RequiredPassword
 
     @property
     def url(self) -> URL:
@@ -50,3 +52,34 @@ class Settings(BaseSettings):
         ):
             raise ValueError("Для legacy и target укажите разные базы PostgreSQL.")
         return self
+
+
+class SchemaSettings(Settings):
+    legacy_db_admin_user: NonEmptyText
+    legacy_db_admin_password: RequiredPassword
+    target_db_admin_user: NonEmptyText
+    target_db_admin_password: RequiredPassword
+
+    @model_validator(mode="after")
+    def validate_administrator_roles(self) -> Self:
+        if (
+            self.legacy_db_admin_user == self.legacy_db.user
+            or self.target_db_admin_user == self.target_db.user
+        ):
+            raise ValueError("Для DDL и операций с данными укажите разные роли PostgreSQL.")
+        return self
+
+    def admin_database(self, side: DatabaseSide) -> DatabaseSettings:
+        if side == "legacy":
+            return self.legacy_db.model_copy(
+                update={
+                    "user": self.legacy_db_admin_user,
+                    "password": self.legacy_db_admin_password,
+                },
+            )
+        return self.target_db.model_copy(
+            update={
+                "user": self.target_db_admin_user,
+                "password": self.target_db_admin_password,
+            },
+        )

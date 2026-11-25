@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from migration_pipeline.config import Settings
+from migration_pipeline.config import SchemaSettings, Settings
 
 pytestmark = pytest.mark.usefixtures("example_env")
 
@@ -44,3 +44,20 @@ def test_rejects_identical_database_addresses(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(ValidationError, match="укажите разные базы"):
         Settings()
+
+
+def test_schema_credentials_are_separate_from_runtime_roles() -> None:
+    settings = SchemaSettings()
+
+    assert settings.legacy_db.user == "legacy_reader"
+    assert settings.admin_database("legacy").user == "legacy_admin"
+    assert settings.target_db.user == "target_writer"
+    assert settings.admin_database("target").user == "target_admin"
+    assert settings.admin_database("target").url.password == "replace-target-admin-password"
+
+
+def test_schema_rejects_an_application_role_as_admin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TARGET_DB_ADMIN_USER", "target_writer")
+
+    with pytest.raises(ValidationError, match="укажите разные роли"):
+        SchemaSettings()

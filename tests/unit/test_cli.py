@@ -3,7 +3,7 @@ from asyncpg.exceptions import InvalidPasswordError
 from typer.testing import CliRunner
 
 from migration_pipeline import cli
-from migration_pipeline.config import DatabaseSettings
+from migration_pipeline.config import DatabaseSettings, DatabaseSide, SchemaSettings
 
 runner = CliRunner()
 
@@ -69,3 +69,46 @@ def test_check_reports_an_auth_error_and_incompatible_version(
     assert "Ошибка аутентификации PostgreSQL" in result.stdout
     assert "Требуется версия 16" in result.stdout
     assert "private connection details" not in result.output
+
+
+@pytest.mark.usefixtures("example_env")
+def test_init_requires_admin_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TARGET_DB_ADMIN_PASSWORD", "")
+
+    result = runner.invoke(cli.app, ["init"])
+
+    assert result.exit_code == 2
+    assert "target_db_admin_password" in result.stderr
+
+
+@pytest.mark.usefixtures("example_env")
+def test_init_applies_both_schemas_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    applied: list[tuple[DatabaseSide, str]] = []
+
+    async def upgrade_schema(settings: SchemaSettings, side: DatabaseSide) -> None:
+        applied.append((side, settings.admin_database(side).user))
+
+    monkeypatch.setattr(cli, "upgrade_schema", upgrade_schema)
+
+    result = runner.invoke(cli.app, ["init"])
+
+    assert result.exit_code == 0
+    assert applied == [("legacy", "legacy_admin"), ("target", "target_admin")]
+
+
+@pytest.mark.usefixtures("example_env")
+def test_init_reports_the_failed_schema_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def upgrade_schema(settings: SchemaSettings, side: DatabaseSide) -> None:
+        if side == "target":
+            raise InvalidPasswordError("private administrative details")
+
+    monkeypatch.setattr(cli, "upgrade_schema", upgrade_schema)
+
+    result = runner.invoke(cli.app, ["init"])
+
+    assert result.exit_code == 1
+    assert "legacy — схема обновлена" in result.stdout
+    assert "target — Ошибка аутентификации PostgreSQL" in result.stderr
+    assert "private administrative details" not in result.output
