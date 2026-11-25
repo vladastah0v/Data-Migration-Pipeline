@@ -17,18 +17,25 @@ x-runner: &runner
     target-db:
       condition: service_healthy
 
-x-runner-env: &runner-env
+x-legacy-env: &legacy-env
   LEGACY_DB__HOST: legacy-db
   LEGACY_DB__PORT: "5432"
   LEGACY_DB__NAME: ${LEGACY_DB__NAME:?Укажите LEGACY_DB__NAME в .env}
   LEGACY_DB__USER: ${LEGACY_DB__USER:?Укажите LEGACY_DB__USER в .env}
   LEGACY_DB__PASSWORD: ${LEGACY_DB__PASSWORD:?Укажите LEGACY_DB__PASSWORD в .env}
+  DB_TIMEOUT_SECONDS: ${DB_TIMEOUT_SECONDS:-5}
+
+x-legacy-admin-env: &legacy-admin-env
+  LEGACY_DB_ADMIN_USER: ${LEGACY_DB_ADMIN_USER:?Укажите LEGACY_DB_ADMIN_USER в .env}
+  LEGACY_DB_ADMIN_PASSWORD: ${LEGACY_DB_ADMIN_PASSWORD:?Укажите LEGACY_DB_ADMIN_PASSWORD в .env}
+
+x-runner-env: &runner-env
+  <<: *legacy-env
   TARGET_DB__HOST: target-db
   TARGET_DB__PORT: "5432"
   TARGET_DB__NAME: ${TARGET_DB__NAME:?Укажите TARGET_DB__NAME в .env}
   TARGET_DB__USER: ${TARGET_DB__USER:?Укажите TARGET_DB__USER в .env}
   TARGET_DB__PASSWORD: ${TARGET_DB__PASSWORD:?Укажите TARGET_DB__PASSWORD в .env}
-  DB_TIMEOUT_SECONDS: ${DB_TIMEOUT_SECONDS:-5}
 
 services:
   legacy-db:
@@ -72,11 +79,20 @@ services:
     profiles: [schema]
     command: ["init"]
     environment:
-      <<: *runner-env
-      LEGACY_DB_ADMIN_USER: ${LEGACY_DB_ADMIN_USER:?Укажите LEGACY_DB_ADMIN_USER в .env}
-      LEGACY_DB_ADMIN_PASSWORD: ${LEGACY_DB_ADMIN_PASSWORD:?Укажите LEGACY_DB_ADMIN_PASSWORD в .env}
+      <<: [*runner-env, *legacy-admin-env]
       TARGET_DB_ADMIN_USER: ${TARGET_DB_ADMIN_USER:?Укажите TARGET_DB_ADMIN_USER в .env}
       TARGET_DB_ADMIN_PASSWORD: ${TARGET_DB_ADMIN_PASSWORD:?Укажите TARGET_DB_ADMIN_PASSWORD в .env}
+
+  seed-runner:
+    build:
+      context: .
+    profiles: [seed]
+    command: ["seed"]
+    depends_on:
+      legacy-db:
+        condition: service_healthy
+    environment:
+      <<: [*legacy-env, *legacy-admin-env]
 
 volumes:
   legacy-data:

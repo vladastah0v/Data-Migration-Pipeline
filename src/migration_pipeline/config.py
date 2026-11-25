@@ -28,7 +28,7 @@ class DatabaseSettings(BaseModel):
         )
 
 
-class Settings(BaseSettings):
+class LegacySettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -38,8 +38,11 @@ class Settings(BaseSettings):
     )
 
     legacy_db: DatabaseSettings
-    target_db: DatabaseSettings
     db_timeout_seconds: Annotated[float, Field(gt=0, le=60)] = 5
+
+
+class Settings(LegacySettings):
+    target_db: DatabaseSettings
 
     @model_validator(mode="after")
     def validate_database_endpoints(self) -> Self:
@@ -54,29 +57,36 @@ class Settings(BaseSettings):
         return self
 
 
-class SchemaSettings(Settings):
+class LegacyAdminSettings(LegacySettings):
     legacy_db_admin_user: NonEmptyText
     legacy_db_admin_password: RequiredPassword
+
+    @model_validator(mode="after")
+    def validate_legacy_administrator(self) -> Self:
+        if self.legacy_db_admin_user == self.legacy_db.user:
+            raise ValueError("Для legacy укажите разные роли администратора и читателя.")
+        return self
+
+    @property
+    def legacy_admin_database(self) -> DatabaseSettings:
+        return self.legacy_db.model_copy(
+            update={"user": self.legacy_db_admin_user, "password": self.legacy_db_admin_password}
+        )
+
+
+class SchemaSettings(Settings, LegacyAdminSettings):
     target_db_admin_user: NonEmptyText
     target_db_admin_password: RequiredPassword
 
     @model_validator(mode="after")
     def validate_administrator_roles(self) -> Self:
-        if (
-            self.legacy_db_admin_user == self.legacy_db.user
-            or self.target_db_admin_user == self.target_db.user
-        ):
+        if self.target_db_admin_user == self.target_db.user:
             raise ValueError("Для DDL и операций с данными укажите разные роли PostgreSQL.")
         return self
 
     def admin_database(self, side: DatabaseSide) -> DatabaseSettings:
         if side == "legacy":
-            return self.legacy_db.model_copy(
-                update={
-                    "user": self.legacy_db_admin_user,
-                    "password": self.legacy_db_admin_password,
-                },
-            )
+            return self.legacy_admin_database
         return self.target_db.model_copy(
             update={
                 "user": self.target_db_admin_user,

@@ -4,6 +4,7 @@ from typer.testing import CliRunner
 
 from migration_pipeline import cli
 from migration_pipeline.config import DatabaseSettings, DatabaseSide, SchemaSettings
+from migration_pipeline.seeding.service import SeedError
 
 runner = CliRunner()
 
@@ -112,3 +113,26 @@ def test_init_reports_the_failed_schema_without_credentials(
     assert "legacy — схема обновлена" in result.stdout
     assert "target — Ошибка аутентификации PostgreSQL" in result.stderr
     assert "private administrative details" not in result.output
+
+
+@pytest.mark.usefixtures("isolated_environment")
+def test_seed_rejects_invalid_rate_before_reading_database_configuration() -> None:
+    result = runner.invoke(cli.app, ["seed", "--invalid-rate", "NaN"])
+
+    assert result.exit_code == 2
+    assert "invalid_rate" in result.stderr
+    assert "legacy_db" not in result.stderr
+
+
+@pytest.mark.usefixtures("example_env")
+def test_seed_reports_a_sealed_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def seed_legacy(*_args: object) -> None:
+        raise SeedError("Снимок legacy уже зафиксирован.")
+
+    monkeypatch.setattr(cli, "seed_legacy", seed_legacy)
+
+    result = runner.invoke(cli.app, ["seed", "--profile", "small"])
+
+    assert result.exit_code == 1
+    assert '"event": "seed_failed"' in result.stderr
+    assert "Снимок legacy уже зафиксирован." in result.stderr

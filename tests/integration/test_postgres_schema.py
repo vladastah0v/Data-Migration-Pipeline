@@ -25,6 +25,8 @@ from migration_pipeline.models.target import (
     OrderItem,
     Payment,
 )
+from migration_pipeline.seeding.data import SeedOptions
+from migration_pipeline.seeding.service import SeedError, _seed_source, seed_legacy
 
 pytestmark = pytest.mark.asyncio
 SEAL_SOURCE = (
@@ -146,6 +148,67 @@ async def test_seal_waits_for_open_legacy_write(settings: SchemaSettings, legacy
             )
             await assert_rejected(sealer, SEAL_SOURCE, "55P03")
         assert await sealer.scalar(SEAL_SOURCE) is not None
+
+
+def ignore_progress(_table: str, _done: int, _total: int) -> None:
+    pass
+
+
+async def test_seed_copies_and_seals_in_one_transaction(settings: SchemaSettings) -> None:
+    options = SeedOptions(
+        batch_size=337, invalid_rate=Decimal("0.02"), duplicate_contact_rate=Decimal("0.1")
+    )
+    async with transaction(settings.legacy_admin_database, settings.db_timeout_seconds) as conn:
+        result = await _seed_source(conn, options, ignore_progress)
+
+        assert [table.rows for table in result.tables] == [1_000, 5_000, 5_000, 10_000]
+        assert [table.invalid_rows for table in result.tables] == [20, 100, 100, 200]
+        assert await conn.scalar(select(LegacySourceSnapshot.snapshot_id)) == result.snapshot_id
+        duplicates = await conn.scalar(
+            text("""
+                SELECT count(*) - count(DISTINCT lower(btrim(email))) FROM legacy_customers
+                WHERE email LIKE '%@%'
+                """)
+        )
+        assert duplicates == result.duplicate_contacts == 97
+        assert (
+            await conn.scalar(
+                text("SELECT count(*) FROM legacy_orders WHERE jsonb_typeof(items_json) = 'object'")
+            )
+            == 20
+        )
+        with pytest.raises(SeedError, match="уже зафиксирован"):
+            await _seed_source(conn, options, ignore_progress)
+
+
+async def test_failed_seed_rolls_back_copied_rows(settings: SchemaSettings) -> None:
+    class Interrupted(RuntimeError):
+        pass
+
+    def fail_after_first_batch(_table: str, done: int, _total: int) -> None:
+        if done:
+            raise Interrupted
+
+    with pytest.raises(Interrupted):
+        await seed_legacy(settings, SeedOptions(batch_size=10), fail_after_first_batch)
+
+    async with transaction(settings.legacy_db, settings.db_timeout_seconds) as conn:
+        assert await conn.scalar(select(func.count()).select_from(LegacyCustomer)) == 0
+        assert await conn.scalar(select(LegacySourceSnapshot.snapshot_id)) is None
+
+
+async def test_seed_preserves_existing_data(settings: SchemaSettings, legacy_id: int) -> None:
+    now = datetime.now(UTC)
+    async with transaction(settings.legacy_admin_database, settings.db_timeout_seconds) as conn:
+        await conn.execute(
+            insert(LegacyCustomer).values(legacy_id=legacy_id, created_at=now, updated_at=now)
+        )
+
+        with pytest.raises(SeedError, match="уже содержит данные"):
+            await _seed_source(conn, SeedOptions(), ignore_progress)
+
+        assert await conn.scalar(select(LegacyCustomer.legacy_id)) == legacy_id
+        assert await conn.scalar(select(LegacySourceSnapshot.snapshot_id)) is None
 
 
 async def test_normalized_customer_keys_deduplicate_within_one_customer(
