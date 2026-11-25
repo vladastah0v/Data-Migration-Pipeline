@@ -1,4 +1,3 @@
-import os
 from collections.abc import AsyncIterator
 from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
@@ -50,14 +49,6 @@ SEAL_SOURCE = (
     .values(snapshot_id=func.gen_random_uuid(), sealed_at=func.clock_timestamp())
     .returning(LegacySourceSnapshot.snapshot_id)
 )
-
-
-@pytest.fixture(scope="module")
-def settings() -> SchemaSettings:
-    env_file = os.getenv("MIGRATION_TEST_ENV_FILE")
-    if not env_file:
-        pytest.skip("Укажите MIGRATION_TEST_ENV_FILE для отдельного тестового стенда PostgreSQL.")
-    return SchemaSettings(_env_file=env_file)
 
 
 @pytest.fixture
