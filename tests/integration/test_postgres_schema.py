@@ -40,6 +40,8 @@ from migration_pipeline.models.target import (
 )
 from migration_pipeline.seeding.data import SeedOptions
 from migration_pipeline.seeding.service import SeedError, _seed_source, seed_legacy
+from migration_pipeline.transformers import preview
+from migration_pipeline.transformers.errors import ErrorPolicy
 
 pytestmark = pytest.mark.asyncio
 SEAL_SOURCE = (
@@ -321,6 +323,90 @@ async def test_extract_uses_each_entity_primary_key_and_checks_snapshot(
             assert [page.last_id async for page in extract_batches(source, entity)] == [
                 legacy_id + offset
             ]
+
+
+async def test_preview_checks_payment_references_between_batches_and_reports_emails(
+    settings: SchemaSettings, legacy_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    async with transaction(settings.legacy_admin_database, settings.db_timeout_seconds) as conn:
+        await conn.execute(
+            insert(LegacyCustomer),
+            [
+                dict(
+                    legacy_id=key,
+                    full_name="Synthetic Customer",
+                    email="same@example.test",
+                    customer_status="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+                for key in (legacy_id, legacy_id + 1)
+            ],
+        )
+        await conn.execute(
+            insert(LegacyOrder).values(
+                legacy_order_id=legacy_id,
+                customer_legacy_id=legacy_id,
+                currency="USD",
+                order_status="completed",
+                order_date_text=now.isoformat(),
+                total_amount="10.02",
+                created_at=now,
+                items_json=[{"product_name": "Product", "quantity": 1, "unit_price": "10.02"}],
+            )
+        )
+        await conn.execute(
+            insert(LegacyPayment),
+            [
+                dict(
+                    legacy_payment_id=key,
+                    legacy_order_id=legacy_id,
+                    payment_reference=ref,
+                    amount="10.02",
+                    payment_status="completed",
+                    payment_date_text=now.isoformat(),
+                )
+                for key, ref in ((legacy_id, " REF-TEST "), (legacy_id + 1, "REF-TEST"))
+            ],
+        )
+        await conn.execute(SEAL_SOURCE)
+
+        @asynccontextmanager
+        async def open_source(_settings, *, expected_snapshot_id):
+            snapshot = await read_source_snapshot(conn, expected_id=expected_snapshot_id)
+            yield LegacySource(conn, snapshot)
+
+        monkeypatch.setattr(preview, "open_legacy_source", open_source)
+        quarantined = []
+        duplicates = []
+        summary = await preview.preview_transform(
+            settings,
+            batch_size=1,
+            policy=ErrorPolicy.QUARANTINE,
+            snapshot_id=None,
+            quarantine=quarantined.append,
+            duplicates=duplicates.append,
+            progress=lambda *_: None,
+        )
+
+    assert [(item.accepted, item.rejected) for item in summary.entities] == [
+        (2, 0),
+        (1, 0),
+        (1, 1),
+        (0, 0),
+    ]
+    assert summary.error_counts == {"payment_reference_conflict": 1}
+    assert summary.duplicate_email_groups == 1 and summary.duplicate_email_members == 2
+    assert len(quarantined) == 1
+    assert quarantined[0]["legacy_record_id"] == legacy_id + 1
+    assert "REF-TEST" not in str(quarantined)
+    assert [row["legacy_record_id"] for row in duplicates] == [legacy_id, legacy_id + 1]
+    assert "same@example.test" not in str(duplicates)
+    async with transaction(settings.target_db, settings.db_timeout_seconds) as target:
+        assert (
+            await target.scalar(select(Customer.id).where(Customer.legacy_id == legacy_id)) is None
+        )
 
 
 async def test_normalized_customer_keys_deduplicate_within_one_customer(

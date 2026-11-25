@@ -1,7 +1,10 @@
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
+from functools import partial
 from uuid import UUID
 
 from alembic.script import ScriptDirectory
@@ -69,7 +72,11 @@ async def read_source_snapshot(
 async def open_legacy_source(
     settings: LegacySettings, *, expected_snapshot_id: UUID | None = None
 ) -> AsyncIterator[LegacySource]:
-    engine = create_database_engine(settings.legacy_db, settings.db_timeout_seconds)
+    engine = create_database_engine(
+        settings.legacy_db,
+        settings.db_timeout_seconds,
+        json_deserializer=partial(json.loads, parse_float=Decimal),
+    )
     try:
         async with engine.connect() as connection:
             await connection.execution_options(

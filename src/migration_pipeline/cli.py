@@ -1,8 +1,12 @@
 import asyncio
 import json
+import os
 import sys
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
 from time import perf_counter
-from typing import Annotated
+from typing import IO, Annotated
 from uuid import UUID
 
 import typer
@@ -43,6 +47,8 @@ from migration_pipeline.seeding.data import (
     SeedProfile,
 )
 from migration_pipeline.seeding.service import SeedError, seed_legacy
+from migration_pipeline.transformers.errors import ErrorPolicy, StrictTransformError
+from migration_pipeline.transformers.preview import PreviewError, ReportEntry, preview_transform
 
 app = typer.Typer(
     name="migration-pipeline",
@@ -248,6 +254,127 @@ async def _inspect_extraction(
             progress.update(task, advance=len(batch.rows))
             _cli_event("extract_batch", snapshot_id=str(source.snapshot.id), **batch.log_fields())
         return source.snapshot.id, batches, records, last_id
+
+
+@app.command()
+def transform(
+    policy: Annotated[ErrorPolicy, typer.Option(help="Политика обработки ошибок.")] = (
+        ErrorPolicy.STRICT
+    ),
+    batch_size: Annotated[
+        int, typer.Option(min=1, max=MAX_EXTRACT_BATCH_SIZE, help="Максимум строк в партии.")
+    ] = DEFAULT_EXTRACT_BATCH_SIZE,
+    snapshot_id: Annotated[
+        UUID | None, typer.Option(help="Ожидаемый UUID зафиксированного снимка.")
+    ] = None,
+    quarantine_file: Annotated[
+        Path | None, typer.Option(dir_okay=False, help="Новый JSONL-файл карантина.")
+    ] = None,
+    duplicates_file: Annotated[
+        Path | None, typer.Option(dir_okay=False, help="Новый JSONL-файл совпадений email.")
+    ] = None,
+) -> None:
+    """Проверить трансформации снимка на временных таблицах PostgreSQL."""
+    if (policy is ErrorPolicy.QUARANTINE) != (quarantine_file is not None):
+        raise typer.BadParameter(
+            "Укажите --quarantine-file при выборе политики quarantine.",
+            param_hint="--quarantine-file",
+        )
+
+    settings = _load_settings(Settings)
+    _cli_event("transform_started", policy=policy.value, batch_size=batch_size)
+    try:
+        with (
+            ExitStack() as reports,
+            Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description} — проверено {task.completed:.0f}"),
+                console=console,
+                disable=not console.is_terminal,
+                redirect_stderr=False,
+            ) as progress,
+        ):
+            quarantine = reports.enter_context(_report_file(quarantine_file))
+            duplicates = reports.enter_context(_report_file(duplicates_file))
+            tasks: dict[LegacyEntity, TaskID] = {}
+
+            def update_progress(entity: LegacyEntity, accepted: int, rejected: int) -> None:
+                if entity not in tasks:
+                    tasks[entity] = progress.add_task(entity.value, total=None)
+                progress.update(tasks[entity], completed=accepted + rejected)
+
+            result = asyncio.run(
+                preview_transform(
+                    settings,
+                    batch_size=batch_size,
+                    policy=policy,
+                    snapshot_id=snapshot_id,
+                    quarantine=lambda row: _write_report(quarantine, row),
+                    duplicates=lambda row: _write_report(duplicates, row),
+                    progress=update_progress,
+                )
+            )
+    except StrictTransformError as exc:
+        _cli_event("transform_failed", **exc.issue.log_fields())
+        error_console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(code=1) from exc
+    except (LegacySourceError, PreviewError, ReportFileError) as exc:
+        _cli_event("transform_failed", reason=type(exc).__name__)
+        error_console.print(str(exc), style="red", markup=False)
+        raise typer.Exit(code=1) from exc
+    except (OSError, SQLAlchemyError, PostgresError, InterfaceError) as exc:
+        _cli_event("transform_failed", reason=type(exc).__name__)
+        error_console.print(_database_error(exc), style="red", markup=False)
+        raise typer.Exit(code=1) from exc
+
+    table = Table("Сущность", "Принято", "Отклонено", title="Проверка трансформаций")
+    for entity in result.entities:
+        table.add_row(entity.entity.value, str(entity.accepted), str(entity.rejected))
+    console.print(table)
+    console.print(
+        f"Совпадения email — {result.duplicate_email_groups} групп, "
+        f"{result.duplicate_email_members} клиентов"
+    )
+    _cli_event(
+        "transform_completed",
+        snapshot_id=str(result.snapshot_id),
+        accepted={entry.entity.value: entry.accepted for entry in result.entities},
+        rejected={entry.entity.value: entry.rejected for entry in result.entities},
+        error_counts=result.error_counts,
+        duplicate_email_groups=result.duplicate_email_groups,
+        duplicate_email_members=result.duplicate_email_members,
+    )
+
+
+class ReportFileError(RuntimeError):
+    """Ошибка создания диагностического отчёта."""
+
+
+@contextmanager
+def _report_file(path: Path | None) -> Iterator[IO[str] | None]:
+    if path is None:
+        yield None
+        return
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise ReportFileError("Файл отчёта уже существует. Выберите новое имя.") from exc
+    except OSError as exc:
+        raise ReportFileError("Не удалось создать файл отчёта.") from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", buffering=1) as report:
+            yield report
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _write_report(report: IO[str] | None, entry: ReportEntry) -> None:
+    if report is not None:
+        try:
+            print(json.dumps(entry, ensure_ascii=False), file=report)
+        except OSError as exc:
+            raise ReportFileError("Ошибка записи в файл отчёта.") from exc
 
 
 def _cli_event(event: str, **fields: object) -> None:
