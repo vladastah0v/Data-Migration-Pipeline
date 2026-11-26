@@ -13,6 +13,15 @@ runner = CliRunner()
 def test_help_is_available_without_settings() -> None:
     assert runner.invoke(cli.app, ["--help"]).exit_code == 0
     assert runner.invoke(cli.app, ["check", "--help"]).exit_code == 0
+    assert runner.invoke(cli.app, ["verify", "--help"]).exit_code == 0
+
+
+@pytest.mark.usefixtures("isolated_environment")
+def test_verify_requires_valid_run_id() -> None:
+    result = runner.invoke(cli.app, ["verify", "--run-id", "invalid"])
+
+    assert result.exit_code == 2
+    assert "UUID" in result.stderr
 
 
 @pytest.mark.usefixtures("isolated_environment")

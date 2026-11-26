@@ -445,6 +445,7 @@ def run_fields(run: RunState) -> dict[str, object]:
         "run_id": str(run.id),
         "snapshot_id": str(run.source_snapshot_id),
         "status": run.status,
+        "verified_at": run.verified_at.isoformat() if run.verified_at is not None else None,
         "records_processed": run.records_processed,
         "records_inserted": run.records_inserted,
         "records_updated": run.records_updated,

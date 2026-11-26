@@ -61,6 +61,7 @@ from migration_pipeline.seeding.data import (
 from migration_pipeline.seeding.service import SeedError, seed_legacy
 from migration_pipeline.transformers.errors import ErrorPolicy, StrictTransformError
 from migration_pipeline.transformers.preview import PreviewError, ReportEntry, preview_transform
+from migration_pipeline.verification.service import verify_run
 
 app = typer.Typer(
     name="migration-pipeline",
@@ -477,6 +478,83 @@ def _run_migration(
 
 
 @app.command()
+def verify(
+    run_id: Annotated[UUID, typer.Option(help="UUID запуска с завершённой загрузкой.")],
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Вывести полный отчёт в JSON.")
+    ] = False,
+) -> None:
+    """Сверить снимок legacy с target и сохранить итоговый статус запуска."""
+    settings = _load_settings(Settings)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description} — проверено {task.completed:.0f}"),
+        console=console,
+        disable=json_output or not console.is_terminal,
+        redirect_stderr=False,
+    ) as progress:
+        tasks: dict[str, TaskID] = {}
+
+        def observe(event: str, fields: dict[str, object]) -> None:
+            _cli_event(event, **fields)
+            entity = str(fields["entity_type"])
+            if entity not in tasks:
+                tasks[entity] = progress.add_task(entity, total=None)
+            progress.update(tasks[entity], completed=int(fields["entity_records_checked"]))
+
+        try:
+            result = asyncio.run(verify_run(settings, run_id, observe))
+        except (
+            LegacySourceError,
+            DatabaseSchemaError,
+            MigrationStateError,
+            MigrationBusyError,
+            OSError,
+            SQLAlchemyError,
+            PostgresError,
+            InterfaceError,
+        ) as exc:
+            _pipeline_startup_error(exc, event="verification_unavailable")
+
+    _cli_event(
+        "verification_completed",
+        **run_fields(result.run),
+        checks=result.report["checks"],
+        duration_seconds=result.report["duration_seconds"],
+    )
+    if json_output:
+        print(json.dumps({**run_fields(result.run), **result.report}, ensure_ascii=False))
+    else:
+        _print_verification(result.run, result.report)
+    if not result.report["passed"]:
+        raise typer.Exit(code=1)
+
+
+def _print_verification(run: RunState, report: dict[str, object]) -> None:
+    console.print(f"Запуск {run.id} — {run.status}")
+    table = Table("Сущность", "Legacy", "Совпали ID", "Отклонено", "Пропущено", "Лишние")
+    for entity, counts in report["records"].items():
+        table.add_row(
+            entity,
+            *(
+                str(counts[name])
+                for name in ("source", "matched", "rejected", "missing", "unexpected")
+            ),
+        )
+    console.print(table)
+    labels = {
+        "record_counts": "Количество записей",
+        "completeness": "Полнота переноса",
+        "foreign_keys": "Внешние связи",
+        "financial": "Денежные суммы",
+        "checksums": "Контрольные суммы",
+    }
+    for name, passed in report["checks"].items():
+        result = "ОК" if passed else "расхождение"
+        console.print(f"{labels[name]} — {result}", style="green" if passed else "red")
+
+
+@app.command()
 def status(
     run_id: Annotated[UUID | None, typer.Option(help="UUID запуска миграции.")] = None,
 ) -> None:
@@ -508,7 +586,7 @@ def status(
     )
 
 
-def _pipeline_startup_error(error: Exception) -> None:
+def _pipeline_startup_error(error: Exception, *, event: str = "migration_unavailable") -> None:
     message = (
         str(error)
         if isinstance(
@@ -516,17 +594,16 @@ def _pipeline_startup_error(error: Exception) -> None:
         )
         else _database_error(error)
     )
-    _cli_event("migration_unavailable", reason=type(error).__name__)
+    _cli_event(event, reason=type(error).__name__)
     error_console.print(message, style="red", markup=False)
     raise typer.Exit(code=1) from error
 
 
 def _print_migration_state(state: RunState) -> None:
-    console.print(f"Запуск {state.id}")
+    console.print(f"Запуск {state.id} — {state.status}")
     console.print(f"Снимок {state.source_snapshot_id}")
-    table = Table("Статус", "Обработано", "Вставлено", "Обновлено", "Без изменений", "Отклонено")
+    table = Table("Обработано", "Вставлено", "Обновлено", "Без изменений", "Отклонено")
     table.add_row(
-        state.status,
         str(state.records_processed),
         str(state.records_inserted),
         str(state.records_updated),
@@ -535,6 +612,8 @@ def _print_migration_state(state: RunState) -> None:
     )
     console.print(table)
     console.print(f"Повторов {state.retry_count}")
+    if state.verified_at is not None:
+        console.print(f"Проверен {state.verified_at.isoformat()}")
     if state.checkpoints:
         checkpoints = Table("Сущность", "Последний ID", "Обработано", "Следующая партия")
         for item in state.checkpoints:

@@ -32,6 +32,9 @@ class MigrationRun(MigrationBase):
         ),
         CheckConstraint("(status = 'RUNNING') = (finished_at IS NULL)", name="finished"),
         CheckConstraint("finished_at >= started_at", name="duration"),
+        CheckConstraint(
+            "(verified_at IS NULL) = (verification_report IS NULL)", name="verification_report"
+        ),
         CheckConstraint("records_unchanged >= 0", name="records_unchanged"),
         CheckConstraint("configuration_hash ~ '^[0-9a-f]{64}$'", name="configuration_hash"),
         CheckConstraint(
@@ -49,6 +52,8 @@ class MigrationRun(MigrationBase):
         DateTime(timezone=True), server_default=text("now()")
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verification_report: Mapped[dict[str, object] | None] = mapped_column(JSONB(none_as_null=True))
     status: Mapped[str] = mapped_column(Text, server_default=text("'RUNNING'"))
     configuration_hash: Mapped[str] = mapped_column(Text)
     configuration: Mapped[dict[str, object] | None] = mapped_column(JSONB(none_as_null=True))

@@ -33,6 +33,8 @@ class RunState:
     source_snapshot_id: UUID
     started_at: datetime
     finished_at: datetime | None
+    verified_at: datetime | None
+    verification_report: dict[str, object] | None
     status: str
     configuration_hash: str
     configuration: dict[str, object] | None
@@ -269,6 +271,26 @@ async def finish_loading(connection: AsyncConnection, run_id: UUID) -> RunState:
     if result is None or (finished is None and result.status not in COMPLETED_STATES):
         raise MigrationStateError("Запуск уже завершён или удалён.")
     return result
+
+
+async def save_verification(
+    connection: AsyncConnection, run_id: UUID, status: str, report: dict[str, object]
+) -> RunState:
+    failed = [name for name, passed in report["checks"].items() if not passed]
+    updated = await connection.scalar(
+        update(MigrationRun)
+        .where(MigrationRun.id == run_id, MigrationRun.status.in_(COMPLETED_STATES))
+        .values(
+            status=status,
+            verified_at=func.clock_timestamp(),
+            verification_report=report,
+            error_message=f"Расхождения в проверках — {', '.join(failed)}." if failed else None,
+        )
+        .returning(MigrationRun.id)
+    )
+    if updated is None:
+        raise MigrationStateError("Запуск недоступен для записи результата проверки.")
+    return await read_run(connection, updated)
 
 
 async def fail_run(
