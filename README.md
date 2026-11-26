@@ -155,6 +155,17 @@ uv run --locked migration-pipeline verify --run-id "$RUN_ID" --json
 
 Команда проверяет полноту по legacy ID, аудит отклонений, внешние связи, денежные значения и контрольные суммы восьми целевых таблиц. Итог `SUCCESS`, `SUCCESS_WITH_REJECTIONS` или `FAILED_VERIFICATION` сохраняется вместе с отчётом в target. Первые два статуса дают код выхода `0`, расхождения дают `1`. Формат отчёта и порядок повторной сверки описаны в [документации верификации](docs/verification.md).
 
+## Бенчмарки стратегий
+
+Команда `benchmark` запускается с хоста из исходного каталога проекта при работающем локальном Docker с Compose. Она сравнивает четыре стратегии на одном синтетическом снимке и проверяет результат каждого прогона. Временный стенд создаётся и удаляется автоматически.
+
+```bash
+uv run --locked migration-pipeline benchmark --profile small --repeats 2
+uv run --locked migration-pipeline benchmark --profile medium --repeats 3
+```
+
+Отчёты `results.json`, `runs.csv` и `batches.csv` сохраняются в `benchmarks/<UUID>`. Доступны [методика бенчмарков](docs/benchmarking.md) и [фактические результаты Small](benchmarks/6fde1748-c887-4ba2-8776-da5a6887043b/results.json).
+
 ## Проверки
 
 ```bash

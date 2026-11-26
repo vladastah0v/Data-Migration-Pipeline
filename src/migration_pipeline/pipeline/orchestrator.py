@@ -217,6 +217,7 @@ class MigrationOrchestrator:
                 after = saved.last_id if saved else None
                 number = saved.next_batch if saved else 1
                 while True:
+                    batch_started = perf_counter()
                     batch = await execution.attempt(
                         "extract_batch",
                         lambda entity=entity, after=after, number=number: _read_batch(
@@ -237,7 +238,12 @@ class MigrationOrchestrator:
                     )
                     execution.pending.clear()
                     active_batch = None
-                    self._emit("migration_batch_committed", run_id=str(run_id), **metrics)
+                    self._emit(
+                        "migration_batch_committed",
+                        run_id=str(run_id),
+                        batch_duration_seconds=round(perf_counter() - batch_started, 6),
+                        **metrics,
+                    )
                     if len(batch.rows) < execution.options.batch_size:
                         break
                     after, number = batch.last_id, batch.number + 1

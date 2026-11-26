@@ -20,6 +20,9 @@ from rich.table import Table
 from rich.text import Text
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
+from migration_pipeline.benchmarking.report import stage_benchmark_report
+from migration_pipeline.benchmarking.sandbox import BenchmarkError
+from migration_pipeline.benchmarking.service import run_benchmark
 from migration_pipeline.config import (
     DatabaseSettings,
     DatabaseSide,
@@ -552,6 +555,125 @@ def _print_verification(run: RunState, report: dict[str, object]) -> None:
     for name, passed in report["checks"].items():
         result = "ОК" if passed else "расхождение"
         console.print(f"{labels[name]} — {result}", style="green" if passed else "red")
+
+
+@app.command()
+def benchmark(
+    profile: Annotated[SeedProfile, typer.Option(help="Профиль синтетического набора.")] = (
+        SeedProfile.SMALL
+    ),
+    random_seed: Annotated[int, typer.Option("--seed", help="Зерно генератора.")] = DEFAULT_SEED,
+    batch_size: Annotated[
+        int, typer.Option(min=1, max=MAX_EXTRACT_BATCH_SIZE, help="Размер партии миграции.")
+    ] = DEFAULT_EXTRACT_BATCH_SIZE,
+    repeats: Annotated[int, typer.Option(min=2, help="Измеряемые прогоны на стратегию.")] = 3,
+    warmups: Annotated[int, typer.Option(min=1, help="Прогревочные прогоны на стратегию.")] = 1,
+    strategy: Annotated[
+        list[LoadStrategy] | None,
+        typer.Option("--strategy", help="Стратегия для сравнения. По умолчанию все четыре."),
+    ] = None,
+    output_dir: Annotated[
+        Path, typer.Option(help="Родительский каталог для отчётов экспериментов.")
+    ] = Path("benchmarks"),
+) -> None:
+    """Сравнить стратегии на одном снимке в отдельном проекте Docker Compose."""
+    strategies = tuple(dict.fromkeys(strategy or LoadStrategy))
+    if profile is SeedProfile.LARGE:
+        error_console.print(
+            "Large включает 1 000 000 исходных записей с учётом истории. "
+            "Подготовка и повторные прогоны требуют времени, памяти и диска.",
+            style="yellow",
+        )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=console,
+        disable=not console.is_terminal,
+        redirect_stderr=False,
+    ) as progress:
+        records = 0
+        task = None
+
+        def observe(event: str, fields: dict[str, object]) -> None:
+            nonlocal records, task
+            _cli_event(event, **fields)
+            if event == "benchmark_resources" and profile is SeedProfile.LARGE:
+                host, docker = fields["host"], fields["docker"]
+                gib = 2**30
+                error_console.print(
+                    f"Хост — CPU {host['logical_cpus']}, доступно RAM "
+                    f"{host['available_memory_bytes'] / gib:.1f} ГиБ, свободно "
+                    f"{host['output_disk_free_bytes'] / gib:.1f} ГиБ для отчётов.\n"
+                    f"Docker — CPU {docker['NCPU']}, RAM {docker['MemTotal'] / gib:.1f} ГиБ, "
+                    f"свободно {fields['docker_data_free_bytes'] / gib:.1f} ГиБ на томе PostgreSQL."
+                )
+            elif event == "benchmark_dataset_ready":
+                records = fields["records"]
+            elif event == "benchmark_trial_started":
+                phase = "Прогрев" if fields["phase"] == "warmup" else "Замер"
+                task = progress.add_task(f"{phase} {fields['strategy']}", total=records)
+            elif event == "benchmark_batch_committed" and task is not None:
+                output.append_batch(fields)
+                progress.advance(task, fields["records_extracted"])
+            elif event == "benchmark_trial_finished" and task is not None:
+                progress.remove_task(task)
+
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with stage_benchmark_report(output_dir) as output:
+                report = asyncio.run(
+                    run_benchmark(
+                        SeedOptions(profile=profile, seed=random_seed),
+                        strategies=strategies,
+                        batch_size=batch_size,
+                        repeats=repeats,
+                        warmups=warmups,
+                        report_root=output_dir,
+                        observer=observe,
+                    )
+                )
+                saved = output.publish(report)
+        except (
+            BenchmarkError,
+            SeedError,
+            LegacySourceError,
+            DatabaseSchemaError,
+            MigrationStateError,
+            MigrationBusyError,
+            OSError,
+            SQLAlchemyError,
+            PostgresError,
+            InterfaceError,
+            CommandError,
+        ) as exc:
+            message = (
+                str(exc) if isinstance(exc, (BenchmarkError, SeedError)) else _database_error(exc)
+            )
+            _cli_event("benchmark_failed", reason=type(exc).__name__)
+            error_console.print(message, markup=False, style="red")
+            raise typer.Exit(code=1) from exc
+
+    table = Table("Стратегия", "Замеры", "Медиана, с", "Медиана, записей/с", "Пик RSS, МиБ")
+    for row in report["summary"]:
+        if row["measurement"] == "MEASURED":
+            table.add_row(
+                row["strategy"],
+                str(row["measured_runs"]),
+                f"{row['median_duration_seconds']:.2f}",
+                f"{row['median_records_per_second']:.0f}",
+                f"{row['peak_rss_bytes'] / 2**20:.1f}",
+            )
+        else:
+            table.add_row(row["strategy"], "NOT_MEASURED")
+    console.print(table)
+    console.print(Text(f"Отчёты сохранены в {saved}"))
+    _cli_event("benchmark_completed", benchmark_id=report["benchmark_id"], status=report["status"])
+    if report["failure"]:
+        error_console.print(Text(report["failure"], style="red"))
+        raise typer.Exit(code=1)
 
 
 @app.command()
