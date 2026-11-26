@@ -43,6 +43,7 @@ class LegacySettings(BaseSettings):
 
 class Settings(LegacySettings):
     target_db: DatabaseSettings
+    migration_lab_mode: bool = False
 
     @model_validator(mode="after")
     def validate_database_endpoints(self) -> Self:

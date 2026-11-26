@@ -9,9 +9,18 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from migration_pipeline.extractors.base import ExtractedBatch
 from migration_pipeline.loaders.base import LoadResult
-from migration_pipeline.models.migration import MigrationBatch, MigrationError, MigrationRun
+from migration_pipeline.models.migration import (
+    MigrationBatch,
+    MigrationCheckpoint,
+    MigrationError,
+    MigrationRetry,
+    MigrationRun,
+)
 from migration_pipeline.pipeline.checkpoint import Checkpoint, advance_checkpoint, read_checkpoints
-from migration_pipeline.transformers.errors import RecordIssue
+from migration_pipeline.pipeline.retry import RetryEntry
+from migration_pipeline.transformers.errors import MESSAGES, RecordIssue
+
+COMPLETED_STATES = {"LOADED", "SUCCESS", "SUCCESS_WITH_REJECTIONS", "FAILED_VERIFICATION"}
 
 
 class MigrationStateError(RuntimeError):
@@ -33,6 +42,7 @@ class RunState:
     records_unchanged: int
     records_rejected: int
     error_message: str | None
+    retry_count: int
     checkpoints: tuple[Checkpoint, ...]
 
 
@@ -41,20 +51,39 @@ async def create_run(
     snapshot_id: UUID,
     configuration: dict[str, object],
     configuration_hash: str,
+    *,
+    run_id: UUID | None = None,
 ) -> UUID:
-    return await connection.scalar(
-        insert(MigrationRun)
-        .values(
-            source_snapshot_id=snapshot_id,
-            configuration=configuration,
-            configuration_hash=configuration_hash,
-        )
-        .returning(MigrationRun.id)
+    stmt = postgres_insert(MigrationRun).values(
+        source_snapshot_id=snapshot_id,
+        configuration=configuration,
+        configuration_hash=configuration_hash,
     )
+    if run_id is not None:
+        stmt = stmt.values(id=run_id).on_conflict_do_nothing(index_elements=[MigrationRun.id])
+    created = await connection.scalar(stmt.returning(MigrationRun.id))
+    if created is not None:
+        return created
+    existing = await connection.scalar(
+        select(MigrationRun.id).where(
+            MigrationRun.id == run_id,
+            MigrationRun.source_snapshot_id == snapshot_id,
+            MigrationRun.configuration_hash == configuration_hash,
+            MigrationRun.status == "RUNNING",
+        )
+    )
+    if existing is None:
+        raise MigrationStateError("Состояние уже созданного запуска отличается.")
+    return existing
 
 
 async def read_run(connection: AsyncConnection, run_id: UUID | None = None) -> RunState | None:
-    query = select(MigrationRun.__table__)
+    retries = (
+        select(func.count(MigrationRetry.id))
+        .where(MigrationRetry.migration_run_id == MigrationRun.id)
+        .scalar_subquery()
+    )
+    query = select(MigrationRun.__table__, retries.label("retry_count"))
     if run_id is None:
         query = query.order_by(MigrationRun.started_at.desc(), MigrationRun.id.desc()).limit(1)
     else:
@@ -64,6 +93,83 @@ async def read_run(connection: AsyncConnection, run_id: UUID | None = None) -> R
         return None
     checkpoints = await read_checkpoints(connection, row["id"])
     return RunState(**row, checkpoints=checkpoints)
+
+
+async def reactivate_run(connection: AsyncConnection, run_id: UUID) -> None:
+    active = await connection.scalar(
+        update(MigrationRun)
+        .where(MigrationRun.id == run_id, MigrationRun.status.in_(("RUNNING", "FAILED_MIGRATION")))
+        .values(status="RUNNING", finished_at=None, error_message=None)
+        .returning(MigrationRun.id)
+    )
+    if active is None:
+        raise MigrationStateError("Запуск недоступен для возобновления.")
+
+
+async def batch_already_committed(
+    connection: AsyncConnection, run_id: UUID, batch: ExtractedBatch
+) -> bool:
+    saved = (
+        await connection.execute(
+            select(
+                MigrationBatch.first_legacy_id,
+                MigrationBatch.last_legacy_id,
+                MigrationBatch.records_count,
+            ).where(
+                MigrationBatch.migration_run_id == run_id,
+                MigrationBatch.entity_type == batch.entity.value,
+                MigrationBatch.batch_number == batch.number,
+                MigrationBatch.status == "COMMITTED",
+            )
+        )
+    ).one_or_none()
+    if saved is None:
+        active = await connection.scalar(
+            select(MigrationRun.id).where(
+                MigrationRun.id == run_id, MigrationRun.status == "RUNNING"
+            )
+        )
+        if active is None:
+            raise MigrationStateError("Запуск уже завершён или требует явного возобновления.")
+        return False
+    checkpoint = await connection.scalar(
+        select(MigrationCheckpoint.last_processed_legacy_id).where(
+            MigrationCheckpoint.migration_run_id == run_id,
+            MigrationCheckpoint.entity_type == batch.entity.value,
+        )
+    )
+    if (
+        tuple(saved) != (batch.first_id, batch.last_id, len(batch.rows))
+        or checkpoint is None
+        or checkpoint < batch.last_id
+    ):
+        raise MigrationStateError(
+            "Подтверждённая партия не согласована с диапазоном или checkpoint."
+        )
+    return True
+
+
+async def save_retries(
+    connection: AsyncConnection, run_id: UUID, entries: Sequence[RetryEntry]
+) -> None:
+    if entries:
+        await connection.execute(
+            postgres_insert(MigrationRetry).on_conflict_do_nothing(
+                index_elements=[MigrationRetry.id]
+            ),
+            [
+                {
+                    "id": event.id,
+                    "migration_run_id": run_id,
+                    "operation": event.operation,
+                    "entity_type": event.entity_type,
+                    "batch_number": event.batch_number,
+                    "attempt": event.attempt,
+                    "reason": event.reason,
+                }
+                for event in entries
+            ],
+        )
 
 
 async def confirm_batch(
@@ -93,7 +199,7 @@ async def confirm_batch(
             "started_at": stmt.excluded.started_at,
             "committed_at": stmt.excluded.committed_at,
         },
-        where=MigrationBatch.status == "FAILED",
+        where=MigrationBatch.status.in_(("FAILED", "STARTED")),
     ).returning(MigrationBatch.id)
     if await connection.scalar(stmt) is None:
         raise MigrationStateError("Партия с таким номером уже подтверждена или выполняется.")
@@ -115,19 +221,38 @@ async def confirm_batch(
 
 
 async def save_issues(
-    connection: AsyncConnection, run_id: UUID, issues: Sequence[RecordIssue]
+    connection: AsyncConnection,
+    run_id: UUID,
+    issues: Sequence[RecordIssue],
+    *,
+    committed: bool = True,
 ) -> None:
     if issues:
+        stmt = postgres_insert(MigrationError)
         await connection.execute(
-            insert(MigrationError),
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    MigrationError.migration_run_id,
+                    MigrationError.entity_type,
+                    MigrationError.legacy_record_id,
+                    MigrationError.error_code,
+                ],
+                set_={
+                    "error_message": stmt.excluded.error_message,
+                    "is_quarantined": stmt.excluded.is_quarantined,
+                    "is_batch_rejection": stmt.excluded.is_batch_rejection,
+                },
+                where=~MigrationError.is_batch_rejection | stmt.excluded.is_batch_rejection,
+            ),
             [
                 {
                     "migration_run_id": run_id,
                     "entity_type": issue.entity.value,
                     "legacy_record_id": issue.legacy_record_id,
                     "error_code": issue.code.value,
-                    "error_message": f"{issue.field} — {issue.log_fields()['error_message']}",
+                    "error_message": f"{issue.field} — {MESSAGES[issue.code]}",
                     "is_quarantined": issue.is_quarantined,
+                    "is_batch_rejection": committed,
                 }
                 for issue in issues
             ],
@@ -140,7 +265,8 @@ async def finish_loading(connection: AsyncConnection, run_id: UUID) -> RunState:
         .values(status="LOADED", finished_at=func.clock_timestamp())
         .returning(MigrationRun.id)
     )
-    if finished is None or (result := await read_run(connection, run_id)) is None:
+    result = await read_run(connection, run_id)
+    if result is None or (finished is None and result.status not in COMPLETED_STATES):
         raise MigrationStateError("Запуск уже завершён или удалён.")
     return result
 
@@ -174,7 +300,7 @@ async def fail_run(
             )
         )
     if issue is not None:
-        await save_issues(connection, run_id, (issue,))
+        await save_issues(connection, run_id, (issue,), committed=False)
     else:
         await connection.execute(
             insert(MigrationError).values(
@@ -183,6 +309,7 @@ async def fail_run(
                 legacy_record_id=None,
                 error_code="migration_failed",
                 error_message=message,
+                is_batch_rejection=False,
             )
         )
 

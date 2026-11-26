@@ -298,6 +298,18 @@ async def test_batch_timeout_includes_wait_for_target_lock(
     )
 
 
+async def test_duplicate_legacy_id_with_different_data_rolls_back(
+    target: AsyncConnection, customer: CustomerData
+) -> None:
+    conflict = replace(customer, first_name="Другое имя")
+    with pytest.raises(LoadConflict, match="внутри партии различаются записи"):
+        await load_batch(target, (customer, conflict), strategy=LoadStrategy.UPSERT)
+    assert (
+        await target.scalar(select(Customer.id).where(Customer.legacy_id == customer.legacy_id))
+        is None
+    )
+
+
 async def test_failed_checkpoint_update_rolls_back_data_and_batch_metadata(
     target: AsyncConnection, customer: CustomerData
 ) -> None:

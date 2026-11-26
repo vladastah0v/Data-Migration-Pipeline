@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from time import perf_counter
@@ -42,12 +42,15 @@ from migration_pipeline.extractors.base import MAX_BATCH_SIZE as MAX_EXTRACT_BAT
 from migration_pipeline.loaders.base import ConflictPolicy, LoadStrategy
 from migration_pipeline.pipeline.orchestrator import (
     MigrationFailed,
+    MigrationObserver,
     MigrationOptions,
     MigrationOrchestrator,
     migration_status,
     run_fields,
 )
-from migration_pipeline.pipeline.state import RunState
+from migration_pipeline.pipeline.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY
+from migration_pipeline.pipeline.sessions import MigrationBusyError
+from migration_pipeline.pipeline.state import MigrationStateError, RunState
 from migration_pipeline.seeding.data import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_SEED,
@@ -370,8 +373,17 @@ def migrate(
     transaction_timeout: Annotated[
         float, typer.Option(help="Таймаут транзакции партии в секундах.")
     ] = 60,
+    max_retries: Annotated[
+        int, typer.Option(min=0, help="Максимум повторов временной ошибки.")
+    ] = DEFAULT_MAX_RETRIES,
+    retry_delay: Annotated[
+        float, typer.Option(help="Начальная задержка перед повтором в секундах.")
+    ] = DEFAULT_RETRY_DELAY,
     snapshot_id: Annotated[
         UUID | None, typer.Option(help="Ожидаемый UUID зафиксированного снимка legacy.")
+    ] = None,
+    fail_after_batches: Annotated[
+        int | None, typer.Option(min=1, help="Лабораторная остановка после подтверждённых партий.")
     ] = None,
 ) -> None:
     """Загрузить снимок legacy в target и сохранить состояние миграции."""
@@ -382,8 +394,39 @@ def migrate(
         policy=policy,
         conflict_policy=conflict_policy,
         transaction_timeout=transaction_timeout,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
     )
     settings = _load_settings(Settings)
+    if fail_after_batches is not None and not settings.migration_lab_mode:
+        raise typer.BadParameter(
+            "Требуется MIGRATION_LAB_MODE=true.",
+            param_hint="--fail-after-batches",
+        )
+    _run_migration(
+        lambda observe: MigrationOrchestrator(settings, options, observe).run(
+            expected_snapshot_id=snapshot_id
+        ),
+        fail_after_batches=fail_after_batches,
+    )
+
+
+@app.command()
+def resume(
+    run_id: Annotated[UUID, typer.Option(help="UUID прерванного запуска.")],
+) -> None:
+    """Возобновить запуск по контрольным точкам в target."""
+    settings = _load_settings(Settings)
+    _run_migration(
+        lambda observe: MigrationOrchestrator(settings, MigrationOptions(), observe).resume(run_id)
+    )
+
+
+def _run_migration(
+    operation: Callable[[MigrationObserver], Awaitable[RunState]],
+    *,
+    fail_after_batches: int | None = None,
+) -> None:
     with Progress(
         SpinnerColumn(),
         TextColumn("{task.description} — обработано {task.completed:.0f}"),
@@ -391,24 +434,28 @@ def migrate(
         disable=not console.is_terminal,
         redirect_stderr=False,
     ) as progress:
-        tasks: dict[object, TaskID] = {}
+        tasks: dict[str, TaskID] = {}
+        confirmed = 0
 
         def observe(event: str, fields: dict[str, object]) -> None:
+            nonlocal confirmed
             _cli_event(event, **fields)
-            if event == "migration_started":
+            if event in {"migration_started", "migration_resumed"}:
                 console.print(f"Запуск {fields['run_id']}")
             if event == "migration_batch_committed":
-                entity = fields["entity_type"]
+                entity = str(fields["entity_type"])
                 if entity not in tasks:
-                    tasks[entity] = progress.add_task(str(entity), total=None)
+                    tasks[entity] = progress.add_task(entity, total=None)
                 progress.update(tasks[entity], advance=int(fields["records_extracted"]))
+                confirmed += 1
+                if confirmed == fail_after_batches:
+                    _cli_event("migration_lab_crash", run_id=fields["run_id"], batches=confirmed)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(75)
 
         try:
-            result = asyncio.run(
-                MigrationOrchestrator(settings, options, observe).run(
-                    expected_snapshot_id=snapshot_id
-                )
-            )
+            result = asyncio.run(operation(observe))
         except MigrationFailed as exc:
             _cli_event("migration_failed", run_id=str(exc.run_id), audited=exc.audited)
             error_console.print(f"{exc.run_id} — {exc}", style="red", markup=False)
@@ -418,6 +465,8 @@ def migrate(
         except (
             LegacySourceError,
             DatabaseSchemaError,
+            MigrationStateError,
+            MigrationBusyError,
             OSError,
             SQLAlchemyError,
             PostgresError,
@@ -462,7 +511,9 @@ def status(
 def _pipeline_startup_error(error: Exception) -> None:
     message = (
         str(error)
-        if isinstance(error, (LegacySourceError, DatabaseSchemaError))
+        if isinstance(
+            error, (LegacySourceError, DatabaseSchemaError, MigrationStateError, MigrationBusyError)
+        )
         else _database_error(error)
     )
     _cli_event("migration_unavailable", reason=type(error).__name__)
@@ -483,6 +534,7 @@ def _print_migration_state(state: RunState) -> None:
         str(state.records_rejected),
     )
     console.print(table)
+    console.print(f"Повторов {state.retry_count}")
     if state.checkpoints:
         checkpoints = Table("Сущность", "Последний ID", "Обработано", "Следующая партия")
         for item in state.checkpoints:

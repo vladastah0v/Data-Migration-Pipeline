@@ -153,3 +153,11 @@ def test_extract_validates_options_before_reading_settings(arguments: list[str])
 
     assert result.exit_code == 2
     assert "legacy_db" not in result.output
+
+
+@pytest.mark.usefixtures("example_env")
+def test_crash_injection_requires_laboratory_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIGRATION_LAB_MODE", "false")
+    result = runner.invoke(cli.app, ["migrate", "--fail-after-batches", "1"])
+    assert result.exit_code == 2
+    assert "MIGRATION_LAB_MODE=true" in result.output

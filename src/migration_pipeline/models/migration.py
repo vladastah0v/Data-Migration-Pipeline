@@ -95,6 +95,7 @@ class MigrationError(MigrationBase):
     error_code: Mapped[str] = mapped_column(Text)
     error_message: Mapped[str] = mapped_column(Text)
     is_quarantined: Mapped[bool] = mapped_column(server_default=text("false"))
+    is_batch_rejection: Mapped[bool] = mapped_column(server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )
@@ -126,3 +127,18 @@ class MigrationBatch(MigrationBase):
         DateTime(timezone=True), server_default=text("now()")
     )
     committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MigrationRetry(MigrationBase):
+    __tablename__ = "migration_retries"
+
+    id: Mapped[UUID] = mapped_column(UuidType, primary_key=True)
+    migration_run_id: Mapped[UUID] = mapped_column(ForeignKey("migration_runs.id"), index=True)
+    operation: Mapped[str] = mapped_column(Text)
+    entity_type: Mapped[str | None] = mapped_column(Text)
+    batch_number: Mapped[int | None] = mapped_column(BigInteger)
+    attempt: Mapped[int] = mapped_column(BigInteger)
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )

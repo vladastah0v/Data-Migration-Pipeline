@@ -31,6 +31,7 @@ x-legacy-admin-env: &legacy-admin-env
 
 x-runner-env: &runner-env
   <<: *legacy-env
+  MIGRATION_LAB_MODE: ${MIGRATION_LAB_MODE:-false}
   TARGET_DB__HOST: target-db
   TARGET_DB__PORT: "5432"
   TARGET_DB__NAME: ${TARGET_DB__NAME:?Укажите TARGET_DB__NAME в .env}

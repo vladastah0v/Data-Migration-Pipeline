@@ -32,6 +32,7 @@ from migration_pipeline.models.migration import (
     MigrationBatch,
     MigrationCheckpoint,
     MigrationError,
+    MigrationRetry,
     MigrationRun,
 )
 from migration_pipeline.models.target import (
@@ -541,7 +542,7 @@ async def test_orchestrator_persists_successful_batches_and_audits_strict_failur
                     (Customer, Customer.legacy_id, (legacy_id, legacy_id + 1)),
                 ):
                     await target.execute(delete(model).where(key.in_(keys)))
-                for model in (MigrationError, MigrationCheckpoint, MigrationBatch):
+                for model in (MigrationRetry, MigrationError, MigrationCheckpoint, MigrationBatch):
                     await target.execute(delete(model).where(model.migration_run_id.in_(run_ids)))
                 await target.execute(delete(MigrationRun).where(MigrationRun.id.in_(run_ids)))
         await engine.dispose()
