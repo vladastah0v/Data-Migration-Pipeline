@@ -12,6 +12,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from migration_pipeline.models.base import schema_metadata
@@ -25,12 +26,13 @@ class MigrationRun(MigrationBase):
     __tablename__ = "migration_runs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('RUNNING', 'SUCCESS', 'SUCCESS_WITH_REJECTIONS', "
+            "status IN ('RUNNING', 'LOADED', 'SUCCESS', 'SUCCESS_WITH_REJECTIONS', "
             "'FAILED_VERIFICATION', 'FAILED_MIGRATION')",
             name="status",
         ),
         CheckConstraint("(status = 'RUNNING') = (finished_at IS NULL)", name="finished"),
         CheckConstraint("finished_at >= started_at", name="duration"),
+        CheckConstraint("records_unchanged >= 0", name="records_unchanged"),
         CheckConstraint("configuration_hash ~ '^[0-9a-f]{64}$'", name="configuration_hash"),
         CheckConstraint(
             "records_processed >= 0 AND records_inserted >= 0 "
@@ -49,10 +51,12 @@ class MigrationRun(MigrationBase):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(Text, server_default=text("'RUNNING'"))
     configuration_hash: Mapped[str] = mapped_column(Text)
+    configuration: Mapped[dict[str, object] | None] = mapped_column(JSONB(none_as_null=True))
     source_snapshot_id: Mapped[UUID] = mapped_column(UuidType)
     records_processed: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     records_inserted: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     records_updated: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    records_unchanged: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     records_rejected: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     error_message: Mapped[str | None] = mapped_column(Text)
 

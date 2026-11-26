@@ -7,13 +7,12 @@ from decimal import Decimal
 from functools import partial
 from uuid import UUID
 
-from alembic.script import ScriptDirectory
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from migration_pipeline.config import LegacySettings
-from migration_pipeline.database.connections import POSTGRES_MAJOR, create_database_engine
-from migration_pipeline.database.schema import revision_config
+from migration_pipeline.database.connections import create_database_engine
+from migration_pipeline.database.schema import DatabaseSchemaError, require_current_schema
 from migration_pipeline.models.legacy import LegacySourceSnapshot
 
 
@@ -34,18 +33,10 @@ class LegacySource:
 
 
 async def require_legacy_schema(connection: AsyncConnection) -> None:
-    if connection.dialect.server_version_info[0] != POSTGRES_MAJOR:
-        raise LegacySourceError(f"Для legacy требуется PostgreSQL {POSTGRES_MAJOR}.")
-    if await connection.scalar(text("SELECT to_regclass('public.alembic_version')")) is None:
-        raise LegacySourceError("Схема legacy отсутствует. Выполните migration-pipeline init.")
-    installed = frozenset(
-        await connection.scalars(text("SELECT version_num FROM public.alembic_version"))
-    )
-    expected = frozenset(ScriptDirectory.from_config(revision_config("legacy")).get_heads())
-    if installed != expected:
-        raise LegacySourceError(
-            "Схема legacy требует обновления. Выполните migration-pipeline init."
-        )
+    try:
+        await require_current_schema(connection, "legacy")
+    except DatabaseSchemaError as exc:
+        raise LegacySourceError(str(exc)) from exc
 
 
 async def read_source_snapshot(

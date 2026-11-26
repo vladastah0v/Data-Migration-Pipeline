@@ -30,7 +30,7 @@ from migration_pipeline.config import (
 )
 from migration_pipeline.database.connections import POSTGRES_MAJOR, read_server_version
 from migration_pipeline.database.legacy import LegacySourceError, open_legacy_source
-from migration_pipeline.database.schema import upgrade_schema
+from migration_pipeline.database.schema import DatabaseSchemaError, upgrade_schema
 from migration_pipeline.extractors.base import (
     BIGINT_MAX,
     BIGINT_MIN,
@@ -39,6 +39,15 @@ from migration_pipeline.extractors.base import (
 )
 from migration_pipeline.extractors.base import DEFAULT_BATCH_SIZE as DEFAULT_EXTRACT_BATCH_SIZE
 from migration_pipeline.extractors.base import MAX_BATCH_SIZE as MAX_EXTRACT_BATCH_SIZE
+from migration_pipeline.loaders.base import ConflictPolicy, LoadStrategy
+from migration_pipeline.pipeline.orchestrator import (
+    MigrationFailed,
+    MigrationOptions,
+    MigrationOrchestrator,
+    migration_status,
+    run_fields,
+)
+from migration_pipeline.pipeline.state import RunState
 from migration_pipeline.seeding.data import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_SEED,
@@ -344,6 +353,145 @@ def transform(
         duplicate_email_groups=result.duplicate_email_groups,
         duplicate_email_members=result.duplicate_email_members,
     )
+
+
+@app.command()
+def migrate(
+    batch_size: Annotated[
+        int, typer.Option(min=1, max=MAX_EXTRACT_BATCH_SIZE, help="Максимум строк в партии.")
+    ] = DEFAULT_EXTRACT_BATCH_SIZE,
+    strategy: Annotated[LoadStrategy, typer.Option(help="Способ загрузки.")] = LoadStrategy.UPSERT,
+    policy: Annotated[
+        ErrorPolicy, typer.Option(help="Политика отклонения записей.")
+    ] = ErrorPolicy.STRICT,
+    conflict_policy: Annotated[
+        ConflictPolicy, typer.Option(help="Политика изменения уже загруженных записей.")
+    ] = ConflictPolicy.VERIFY,
+    transaction_timeout: Annotated[
+        float, typer.Option(help="Таймаут транзакции партии в секундах.")
+    ] = 60,
+    snapshot_id: Annotated[
+        UUID | None, typer.Option(help="Ожидаемый UUID зафиксированного снимка legacy.")
+    ] = None,
+) -> None:
+    """Загрузить снимок legacy в target и сохранить состояние миграции."""
+    options = _load_settings(
+        MigrationOptions,
+        batch_size=batch_size,
+        strategy=strategy,
+        policy=policy,
+        conflict_policy=conflict_policy,
+        transaction_timeout=transaction_timeout,
+    )
+    settings = _load_settings(Settings)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description} — обработано {task.completed:.0f}"),
+        console=console,
+        disable=not console.is_terminal,
+        redirect_stderr=False,
+    ) as progress:
+        tasks: dict[object, TaskID] = {}
+
+        def observe(event: str, fields: dict[str, object]) -> None:
+            _cli_event(event, **fields)
+            if event == "migration_started":
+                console.print(f"Запуск {fields['run_id']}")
+            if event == "migration_batch_committed":
+                entity = fields["entity_type"]
+                if entity not in tasks:
+                    tasks[entity] = progress.add_task(str(entity), total=None)
+                progress.update(tasks[entity], advance=int(fields["records_extracted"]))
+
+        try:
+            result = asyncio.run(
+                MigrationOrchestrator(settings, options, observe).run(
+                    expected_snapshot_id=snapshot_id
+                )
+            )
+        except MigrationFailed as exc:
+            _cli_event("migration_failed", run_id=str(exc.run_id), audited=exc.audited)
+            error_console.print(f"{exc.run_id} — {exc}", style="red", markup=False)
+            if not exc.audited:
+                error_console.print("Запись ошибки в target недоступна.", style="red")
+            raise typer.Exit(code=1) from exc
+        except (
+            LegacySourceError,
+            DatabaseSchemaError,
+            OSError,
+            SQLAlchemyError,
+            PostgresError,
+            InterfaceError,
+        ) as exc:
+            _pipeline_startup_error(exc)
+    _print_migration_state(result)
+
+
+@app.command()
+def status(
+    run_id: Annotated[UUID | None, typer.Option(help="UUID запуска миграции.")] = None,
+) -> None:
+    """Показать запуск, счётчики и подтверждённые контрольные точки."""
+    settings = _load_settings(Settings)
+    try:
+        result = asyncio.run(migration_status(settings, run_id))
+    except (DatabaseSchemaError, OSError, SQLAlchemyError, PostgresError, InterfaceError) as exc:
+        _pipeline_startup_error(exc)
+    if result is None:
+        if run_id is None:
+            console.print("Запусков миграции пока нет.")
+            return
+        error_console.print(f"Запуск {run_id} не найден.", style="red")
+        raise typer.Exit(code=1)
+    _print_migration_state(result)
+    _cli_event(
+        "migration_status",
+        **run_fields(result),
+        checkpoints=[
+            {
+                "entity_type": item.entity.value,
+                "last_processed_id": item.last_id,
+                "records_processed": item.processed,
+                "next_batch": item.next_batch,
+            }
+            for item in result.checkpoints
+        ],
+    )
+
+
+def _pipeline_startup_error(error: Exception) -> None:
+    message = (
+        str(error)
+        if isinstance(error, (LegacySourceError, DatabaseSchemaError))
+        else _database_error(error)
+    )
+    _cli_event("migration_unavailable", reason=type(error).__name__)
+    error_console.print(message, style="red", markup=False)
+    raise typer.Exit(code=1) from error
+
+
+def _print_migration_state(state: RunState) -> None:
+    console.print(f"Запуск {state.id}")
+    console.print(f"Снимок {state.source_snapshot_id}")
+    table = Table("Статус", "Обработано", "Вставлено", "Обновлено", "Без изменений", "Отклонено")
+    table.add_row(
+        state.status,
+        str(state.records_processed),
+        str(state.records_inserted),
+        str(state.records_updated),
+        str(state.records_unchanged),
+        str(state.records_rejected),
+    )
+    console.print(table)
+    if state.checkpoints:
+        checkpoints = Table("Сущность", "Последний ID", "Обработано", "Следующая партия")
+        for item in state.checkpoints:
+            checkpoints.add_row(
+                item.entity.value, str(item.last_id), str(item.processed), str(item.next_batch)
+            )
+        console.print(checkpoints)
+    if state.error_message:
+        console.print(Text(state.error_message, style="red"))
 
 
 class ReportFileError(RuntimeError):

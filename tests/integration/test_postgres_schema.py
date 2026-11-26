@@ -2,11 +2,11 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from alembic.script import ScriptDirectory
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql import Executable
@@ -28,15 +28,22 @@ from migration_pipeline.models.legacy import (
     LegacySourceSnapshot,
     LegacyStatusHistory,
 )
-from migration_pipeline.models.migration import MigrationBatch, MigrationCheckpoint, MigrationRun
+from migration_pipeline.models.migration import (
+    MigrationBatch,
+    MigrationCheckpoint,
+    MigrationError,
+    MigrationRun,
+)
 from migration_pipeline.models.target import (
     Address,
     Customer,
     CustomerContact,
     Order,
     OrderItem,
+    OrderStatusHistory,
     Payment,
 )
+from migration_pipeline.pipeline import orchestrator
 from migration_pipeline.seeding.data import SeedOptions
 from migration_pipeline.seeding.service import SeedError, _seed_source, seed_legacy
 from migration_pipeline.transformers import preview
@@ -398,6 +405,146 @@ async def test_preview_checks_payment_references_between_batches_and_reports_ema
         assert (
             await target.scalar(select(Customer.id).where(Customer.legacy_id == legacy_id)) is None
         )
+
+
+async def test_orchestrator_persists_successful_batches_and_audits_strict_failure(
+    settings: SchemaSettings, legacy_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime.now(UTC)
+    run_ids = []
+
+    def observe(event: str, fields: dict[str, object]) -> None:
+        if event == "migration_started":
+            run_ids.append(UUID(str(fields["run_id"])))
+
+    engine = create_database_engine(settings.target_db, settings.db_timeout_seconds)
+    try:
+        async with engine.connect() as target:
+            assert (
+                await target.scalar(
+                    select(Customer.id).where(Customer.legacy_id.in_((legacy_id, legacy_id + 1)))
+                )
+                is None
+            )
+            assert (
+                await target.scalar(
+                    select(Order.id).where(Order.legacy_order_id.in_((legacy_id, legacy_id + 1)))
+                )
+                is None
+            )
+            assert (
+                await target.scalar(
+                    select(Payment.id).where(Payment.legacy_payment_id == legacy_id)
+                )
+                is None
+            )
+            assert (
+                await target.scalar(
+                    select(OrderStatusHistory.id).where(
+                        OrderStatusHistory.legacy_history_id == legacy_id
+                    )
+                )
+                is None
+            )
+
+        async with transaction(
+            settings.legacy_admin_database, settings.db_timeout_seconds
+        ) as source:
+            await source.execute(
+                insert(LegacyCustomer),
+                [
+                    dict(
+                        legacy_id=key,
+                        full_name="Synthetic Customer",
+                        customer_status="active",
+                        email=email,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    for key, email in ((legacy_id, "ok@example.test"), (legacy_id + 1, "invalid"))
+                ],
+            )
+            await source.execute(
+                insert(LegacyOrder),
+                [
+                    dict(
+                        legacy_order_id=key,
+                        customer_legacy_id=key,
+                        currency="USD",
+                        order_status="completed",
+                        order_date_text=now.isoformat(),
+                        total_amount="10.02",
+                        created_at=now,
+                        items_json=[
+                            {"product_name": "Product", "quantity": 1, "unit_price": "10.02"}
+                        ],
+                    )
+                    for key in (legacy_id, legacy_id + 1)
+                ],
+            )
+            await source.execute(
+                insert(LegacyPayment).values(
+                    legacy_payment_id=legacy_id,
+                    legacy_order_id=legacy_id,
+                    payment_reference=f"TEST-{legacy_id}",
+                    amount="10.02",
+                    payment_status="completed",
+                    payment_date_text=now.isoformat(),
+                )
+            )
+            await source.execute(
+                insert(LegacyStatusHistory).values(
+                    id=legacy_id,
+                    legacy_order_id=legacy_id,
+                    new_status="completed",
+                    changed_at_text=now.isoformat(),
+                )
+            )
+            await source.execute(SEAL_SOURCE)
+
+            @asynccontextmanager
+            async def open_source(_settings, *, expected_snapshot_id):
+                snapshot = await read_source_snapshot(source, expected_id=expected_snapshot_id)
+                yield LegacySource(source, snapshot)
+
+            monkeypatch.setattr(orchestrator, "open_legacy_source", open_source)
+            strict = orchestrator.MigrationOptions(batch_size=1)
+            with pytest.raises(orchestrator.MigrationFailed) as failure:
+                await orchestrator.MigrationOrchestrator(settings, strict, observe).run()
+            assert failure.value.audited
+            failed = await orchestrator.migration_status(settings, failure.value.run_id)
+            assert failed is not None and failed.status == "FAILED_MIGRATION"
+            assert failed.records_processed == 1
+            assert [checkpoint.last_id for checkpoint in failed.checkpoints] == [legacy_id]
+
+            quarantine = orchestrator.MigrationOptions(batch_size=1, policy=ErrorPolicy.QUARANTINE)
+            result = await orchestrator.MigrationOrchestrator(settings, quarantine, observe).run()
+            assert result.status == "LOADED"
+            assert (result.records_processed, result.records_inserted) == (6, 3)
+            assert (result.records_unchanged, result.records_rejected) == (1, 2)
+            assert await orchestrator.migration_status(settings, result.id) == result
+            async with engine.connect() as target:
+                codes = await target.scalars(
+                    select(MigrationError.error_code).where(
+                        MigrationError.migration_run_id == result.id,
+                        MigrationError.is_quarantined.is_(True),
+                    )
+                )
+                assert set(codes) == {"invalid_email", "missing_parent"}
+    finally:
+        if run_ids:
+            async with engine.begin() as target:
+                for model, key, keys in (
+                    (OrderStatusHistory, OrderStatusHistory.legacy_history_id, (legacy_id,)),
+                    (Payment, Payment.legacy_payment_id, (legacy_id,)),
+                    (Order, Order.legacy_order_id, (legacy_id, legacy_id + 1)),
+                    (Customer, Customer.legacy_id, (legacy_id, legacy_id + 1)),
+                ):
+                    await target.execute(delete(model).where(key.in_(keys)))
+                for model in (MigrationError, MigrationCheckpoint, MigrationBatch):
+                    await target.execute(delete(model).where(model.migration_run_id.in_(run_ids)))
+                await target.execute(delete(MigrationRun).where(MigrationRun.id.in_(run_ids)))
+        await engine.dispose()
 
 
 async def test_normalized_customer_keys_deduplicate_within_one_customer(

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from migration_pipeline.config import SchemaSettings
 from migration_pipeline.database.connections import create_database_engine
 from migration_pipeline.database.schema import SCHEMA_LOCK_KEY
+from migration_pipeline.extractors.base import ExtractedBatch, LegacyEntity
 from migration_pipeline.loaders.base import (
     ConflictPolicy,
     LoadConflict,
@@ -18,6 +19,7 @@ from migration_pipeline.loaders.base import (
     LoadStrategy,
     load_batch,
 )
+from migration_pipeline.models.migration import MigrationBatch
 from migration_pipeline.models.target import (
     Address,
     Customer,
@@ -28,6 +30,9 @@ from migration_pipeline.models.target import (
     OrderStatusHistory,
     Payment,
 )
+from migration_pipeline.pipeline.checkpoint import CheckpointError
+from migration_pipeline.pipeline.orchestrator import MigrationOptions
+from migration_pipeline.pipeline.state import confirm_batch, create_run, read_run
 from migration_pipeline.transformers.customers import AddressData, ContactData, CustomerData
 from migration_pipeline.transformers.orders import OrderData, OrderItemData
 from migration_pipeline.transformers.payments import PaymentData
@@ -290,4 +295,52 @@ async def test_batch_timeout_includes_wait_for_target_lock(
     assert (
         await target.scalar(select(Customer.id).where(Customer.legacy_id == customer.legacy_id))
         is None
+    )
+
+
+async def test_failed_checkpoint_update_rolls_back_data_and_batch_metadata(
+    target: AsyncConnection, customer: CustomerData
+) -> None:
+    options = MigrationOptions()
+    run_id = await create_run(
+        target, uuid4(), options.model_dump(mode="json"), options.fingerprint()
+    )
+    first = ExtractedBatch(
+        LegacyEntity.CUSTOMERS,
+        1,
+        customer.legacy_id,
+        customer.legacy_id,
+        ({"legacy_id": customer.legacy_id},),
+        0.0,
+    )
+    async with target.begin_nested():
+        loaded = await load_batch(target, (customer,), strategy=options.strategy)
+        await confirm_batch(target, run_id, first, loaded, ())
+
+    earlier = replace(customer, legacy_id=customer.legacy_id - 1)
+    overlaps = ExtractedBatch(
+        LegacyEntity.CUSTOMERS,
+        2,
+        earlier.legacy_id,
+        earlier.legacy_id,
+        ({"legacy_id": earlier.legacy_id},),
+        0.0,
+    )
+    with pytest.raises(CheckpointError):
+        async with target.begin_nested():
+            loaded = await load_batch(target, (earlier,), strategy=options.strategy)
+            await confirm_batch(target, run_id, overlaps, loaded, ())
+    assert (
+        await target.scalar(select(Customer.id).where(Customer.legacy_id == earlier.legacy_id))
+        is None
+    )
+    batch_numbers = await target.scalars(
+        select(MigrationBatch.batch_number).where(MigrationBatch.migration_run_id == run_id)
+    )
+    assert list(batch_numbers) == [1]
+    state = await read_run(target, run_id)
+    assert state is not None and state.records_processed == 1
+    assert (state.checkpoints[0].last_id, state.checkpoints[0].next_batch) == (
+        customer.legacy_id,
+        2,
     )

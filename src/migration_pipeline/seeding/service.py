@@ -3,13 +3,13 @@ from dataclasses import dataclass
 from itertools import islice
 from uuid import UUID
 
-from sqlalchemy import exists, func, select, text, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from migration_pipeline.config import LegacyAdminSettings
 from migration_pipeline.database.connections import create_database_engine
 from migration_pipeline.database.legacy import LegacySourceError, require_legacy_schema
-from migration_pipeline.database.schema import SCHEMA_LOCK_KEY
+from migration_pipeline.database.schema import lock_schema
 from migration_pipeline.models.legacy import LegacySourceSnapshot
 from migration_pipeline.seeding.data import LegacyDataGenerator, SeedOptions, SourceRows
 
@@ -82,9 +82,7 @@ async def _seed_source(
 
 
 async def _require_open_source(connection: AsyncConnection, tables: tuple[SourceRows, ...]) -> None:
-    await connection.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": SCHEMA_LOCK_KEY}
-    )
+    await lock_schema(connection)
     try:
         await require_legacy_schema(connection)
     except LegacySourceError as exc:

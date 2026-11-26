@@ -6,11 +6,11 @@ from enum import StrEnum
 from itertools import batched
 
 from asyncpg import PostgresError
-from sqlalchemy import Text, cast, select, text
+from sqlalchemy import Text, cast, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from migration_pipeline.database.schema import SCHEMA_LOCK_KEY
+from migration_pipeline.database.schema import lock_schema
 from migration_pipeline.loaders.batch import insert_rows
 from migration_pipeline.loaders.copy import copy_rows
 from migration_pipeline.loaders.json_values import equivalent_json
@@ -98,9 +98,7 @@ async def load_batch(
     results = []
     try:
         async with asyncio.timeout(transaction_timeout), connection.begin_nested():
-            await connection.execute(
-                text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": SCHEMA_LOCK_KEY}
-            )
+            await lock_schema(connection)
             async for spec, rows in groups_for_batch(connection, records):
                 results.append(
                     await _write_group(connection, spec, rows, strategy, conflict_policy)

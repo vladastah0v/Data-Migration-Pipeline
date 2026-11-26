@@ -2,8 +2,10 @@ from collections.abc import Callable
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from alembic.util import CommandError
 from sqlalchemy import Connection, text
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from migration_pipeline.config import DatabaseSide, SchemaSettings
 from migration_pipeline.database.connections import POSTGRES_MAJOR, create_database_engine
@@ -12,12 +14,37 @@ from migration_pipeline.database.connections import POSTGRES_MAJOR, create_datab
 SCHEMA_LOCK_KEY = 581_564_284_644_221_778
 
 
+class DatabaseSchemaError(RuntimeError):
+    """Версия PostgreSQL или состояние схемы не подходит для запуска."""
+
+
 def revision_config(side: DatabaseSide) -> Config:
     config = Config(ini_section=side)
     config.set_main_option("script_location", "migration_pipeline:migrations")
     config.set_main_option("version_locations", f"migration_pipeline:migrations/{side}/versions")
     config.set_main_option("path_separator", "newline")
     return config
+
+
+async def lock_schema(connection: AsyncConnection) -> None:
+    await connection.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": SCHEMA_LOCK_KEY}
+    )
+
+
+async def require_current_schema(connection: AsyncConnection, side: DatabaseSide) -> None:
+    if connection.dialect.server_version_info[0] != POSTGRES_MAJOR:
+        raise DatabaseSchemaError(f"Для {side} требуется PostgreSQL {POSTGRES_MAJOR}.")
+    if await connection.scalar(text("SELECT to_regclass('public.alembic_version')")) is None:
+        raise DatabaseSchemaError(f"Схема {side} отсутствует. Выполните migration-pipeline init.")
+    installed = frozenset(
+        await connection.scalars(text("SELECT version_num FROM public.alembic_version"))
+    )
+    expected = frozenset(ScriptDirectory.from_config(revision_config(side)).get_heads())
+    if installed != expected:
+        raise DatabaseSchemaError(
+            f"Схема {side} требует обновления. Выполните migration-pipeline init."
+        )
 
 
 async def with_schema_connection(
@@ -29,9 +56,7 @@ async def with_schema_connection(
             server_version = connection.dialect.server_version_info
             if server_version[0] != POSTGRES_MAJOR:
                 raise CommandError(f"Для {side} требуется PostgreSQL {POSTGRES_MAJOR}.")
-            await connection.execute(
-                text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": SCHEMA_LOCK_KEY}
-            )
+            await lock_schema(connection)
             await connection.run_sync(apply)
     finally:
         await engine.dispose()
