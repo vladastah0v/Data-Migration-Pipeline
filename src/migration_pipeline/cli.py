@@ -52,9 +52,13 @@ from migration_pipeline.pipeline.orchestrator import (
     migration_status,
     run_fields,
 )
+from migration_pipeline.pipeline.resources import process_peak_rss
 from migration_pipeline.pipeline.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY
 from migration_pipeline.pipeline.sessions import MigrationBusyError
 from migration_pipeline.pipeline.state import MigrationStateError, RunState
+from migration_pipeline.reporting.charts import BenchmarkChartError, make_benchmark_chart
+from migration_pipeline.reporting.render import render_report
+from migration_pipeline.reporting.service import ReportFormat, migration_report
 from migration_pipeline.seeding.data import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_SEED,
@@ -409,9 +413,9 @@ def migrate(
             param_hint="--fail-after-batches",
         )
     _run_migration(
-        lambda observe: MigrationOrchestrator(settings, options, observe).run(
-            expected_snapshot_id=snapshot_id
-        ),
+        lambda observe: MigrationOrchestrator(
+            settings, options, observe, peak_rss=process_peak_rss
+        ).run(expected_snapshot_id=snapshot_id),
         fail_after_batches=fail_after_batches,
     )
 
@@ -423,7 +427,9 @@ def resume(
     """Возобновить запуск по контрольным точкам в target."""
     settings = _load_settings(Settings)
     _run_migration(
-        lambda observe: MigrationOrchestrator(settings, MigrationOptions(), observe).resume(run_id)
+        lambda observe: MigrationOrchestrator(
+            settings, MigrationOptions(), observe, peak_rss=process_peak_rss
+        ).resume(run_id)
     )
 
 
@@ -556,6 +562,57 @@ def _print_verification(run: RunState, report: dict[str, object]) -> None:
     for name, passed in report["checks"].items():
         result = "ОК" if passed else "расхождение"
         console.print(f"{labels[name]} — {result}", style="green" if passed else "red")
+
+
+@app.command()
+def report(
+    run_id: Annotated[UUID, typer.Option(help="UUID запуска миграции.")],
+    format: Annotated[ReportFormat, typer.Option(help="Формат отчёта.")] = ReportFormat.MARKDOWN,
+    output: Annotated[
+        Path | None, typer.Option(help="Создать файл вместо вывода в stdout.")
+    ] = None,
+) -> None:
+    """Сформировать отчёт по журналу миграции и сохранённой верификации."""
+    settings = _load_settings(Settings)
+    try:
+        result = asyncio.run(migration_report(settings, run_id))
+    except (
+        DatabaseSchemaError,
+        MigrationStateError,
+        OSError,
+        SQLAlchemyError,
+        PostgresError,
+        InterfaceError,
+    ) as exc:
+        _pipeline_startup_error(exc, event="migration_report_failed")
+
+    content = render_report(result, format)
+    try:
+        with _report_file(output) as destination:
+            (destination if destination is not None else sys.stdout).write(content)
+    except (OSError, ReportFileError) as exc:
+        message = str(exc) if isinstance(exc, ReportFileError) else "Не удалось записать отчёт."
+        _cli_event("migration_report_failed", run_id=str(run_id), reason=type(exc).__name__)
+        error_console.print(message, markup=False, style="red")
+        raise typer.Exit(code=1) from exc
+    _cli_event(
+        "migration_report_created", run_id=str(run_id), format=format, status=result["status"]
+    )
+
+
+@app.command()
+def benchmark_charts(
+    results: Annotated[Path, typer.Option(help="Путь к results.json эксперимента.")],
+    output: Annotated[Path, typer.Option(help="Путь к создаваемому PNG.")],
+) -> None:
+    """Построить четыре графика из фактических замеров бенчмарка."""
+    try:
+        make_benchmark_chart(results, output)
+    except BenchmarkChartError as exc:
+        error_console.print(str(exc), markup=False, style="red")
+        raise typer.Exit(code=1) from exc
+    console.print(Text(f"Графики сохранены в {output}"))
+    _cli_event("benchmark_charts_created")
 
 
 @app.command()

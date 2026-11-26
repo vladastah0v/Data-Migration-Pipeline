@@ -43,6 +43,7 @@ class RunState:
     records_updated: int
     records_unchanged: int
     records_rejected: int
+    peak_rss_bytes: int | None
     error_message: str | None
     retry_count: int
     checkpoints: tuple[Checkpoint, ...]
@@ -171,6 +172,18 @@ async def save_retries(
                 }
                 for event in entries
             ],
+        )
+
+
+async def save_peak_rss(connection: AsyncConnection, run_id: UUID, peak: int | None) -> None:
+    if peak is not None:
+        await connection.execute(
+            update(MigrationRun)
+            .where(
+                MigrationRun.id == run_id,
+                MigrationRun.peak_rss_bytes.is_(None) | (MigrationRun.peak_rss_bytes < peak),
+            )
+            .values(peak_rss_bytes=peak)
         )
 
 

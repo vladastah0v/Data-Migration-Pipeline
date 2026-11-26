@@ -36,6 +36,7 @@ class MigrationRun(MigrationBase):
             "(verified_at IS NULL) = (verification_report IS NULL)", name="verification_report"
         ),
         CheckConstraint("records_unchanged >= 0", name="records_unchanged"),
+        CheckConstraint("peak_rss_bytes > 0", name="peak_rss_bytes"),
         CheckConstraint("configuration_hash ~ '^[0-9a-f]{64}$'", name="configuration_hash"),
         CheckConstraint(
             "records_processed >= 0 AND records_inserted >= 0 "
@@ -63,6 +64,7 @@ class MigrationRun(MigrationBase):
     records_updated: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     records_unchanged: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     records_rejected: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    peak_rss_bytes: Mapped[int | None] = mapped_column(BigInteger)
     error_message: Mapped[str | None] = mapped_column(Text)
 
 

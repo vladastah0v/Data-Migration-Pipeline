@@ -1,0 +1,116 @@
+name: Проверки проекта
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Ruff, PostgreSQL, pytest и Docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      COMPOSE_PROJECT_NAME: migration-ci
+    steps:
+      - name: Получить исходный код
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Установить Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Установить uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.13.7"
+
+      - name: Проверить зависимости и код
+        run: |
+          uv lock --check
+          uv sync --locked --extra charts
+          uv run --locked --extra charts ruff check .
+          uv run --locked --extra charts ruff format --check .
+
+      - name: Запустить отдельные базы PostgreSQL
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from secrets import token_hex
+
+          path = Path(".env")
+          with path.open("x") as output:
+              path.chmod(0o600)
+              for line in Path(".env.example").read_text().splitlines():
+                  key, separator, _ = line.partition("=")
+                  if separator and not key.startswith("#") and key.endswith("PASSWORD"):
+                      line = f"{key}={token_hex(20)}"
+                  if key == "DB_TIMEOUT_SECONDS":
+                      line = f"{key}=30"
+                  output.write(line + "\n")
+          PY
+          docker compose config --quiet
+          docker compose up -d --wait legacy-db target-db
+          uv run --locked --extra charts migration-pipeline init
+          uv run --locked --extra charts alembic -n legacy check
+          uv run --locked --extra charts alembic -n target check
+
+      - name: Выполнить тесты с порогом покрытия 80%
+        env:
+          MIGRATION_TEST_ENV_FILE: ${{ github.workspace }}/.env
+        run: uv run --locked --extra charts pytest -q --cov=migration_pipeline --cov-fail-under=80
+
+      - name: Проверить миграцию, верификацию и отчёты Small
+        run: |
+          uv run --locked --extra charts migration-pipeline seed --profile small --seed 42
+          uv run --locked --extra charts migration-pipeline migrate --strategy copy \
+            2>"$RUNNER_TEMP/migration-events.jsonl"
+          run_id="$(python - "$RUNNER_TEMP/migration-events.jsonl" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as entries:
+              print(next(event["run_id"] for event in map(json.loads, entries)
+                         if event["event"] == "migration_started"))
+          PY
+          )"
+          uv run --locked --extra charts migration-pipeline verify --run-id "$run_id"
+          uv run --locked --extra charts migration-pipeline report --run-id "$run_id" \
+            --format json --output "$RUNNER_TEMP/migration-report.json"
+          uv run --locked --extra charts migration-pipeline report --run-id "$run_id" \
+            --output "$RUNNER_TEMP/migration-report.md"
+          python - "$RUNNER_TEMP/migration-report.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as source:
+              report = json.load(source)
+          assert report["status"] == "SUCCESS"
+          assert report["records_source"] == report["records_transferred"] == 21_000
+          assert report["verification_report"]["passed"]
+          assert report["peak_rss_bytes"] > 0
+          PY
+
+      - name: Построить графики из сохранённых замеров
+        run: |
+          uv run --locked --extra charts migration-pipeline benchmark-charts \
+            --results benchmarks/6fde1748-c887-4ba2-8776-da5a6887043b/results.json \
+            --output "$RUNNER_TEMP/benchmark-small.png"
+
+      - name: Собрать и проверить образ приложения
+        run: |
+          docker build --tag data-migration-pipeline:ci .
+          docker run --rm data-migration-pipeline:ci report --help
+
+      - name: Удалить временные базы
+        if: always()
+        run: |
+          if [ -f .env ]; then
+            docker compose down --volumes --timeout 5
+          fi

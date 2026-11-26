@@ -1,0 +1,269 @@
+{
+  "format_version": 1,
+  "run_id": "a40a56e4-864d-45c0-9d02-76529cfd32b4",
+  "source_snapshot_id": "26e67430-4382-4a03-8585-cb3a29bbaef7",
+  "status": "SUCCESS",
+  "started_at": "2026-11-26T17:16:14.344717+00:00",
+  "finished_at": "2026-11-26T17:16:21.964920+00:00",
+  "observed_at": "2026-11-26T17:16:34.881251+00:00",
+  "strategy": "copy",
+  "batch_size": 1000,
+  "policy": "strict",
+  "records_source": 21000,
+  "source_count_basis": "VERIFICATION",
+  "records_processed": 21000,
+  "records_transferred": 21000,
+  "records_inserted": 21000,
+  "records_updated": 0,
+  "records_unchanged": 0,
+  "records_rejected": 0,
+  "error_count": 0,
+  "error_message": null,
+  "duration_seconds": 7.620203,
+  "records_per_second": 2755.8320952867,
+  "peak_rss_bytes": 97173504,
+  "peak_rss_measurement": "MEASURED",
+  "verified_at": "2026-11-26T17:16:30.850228+00:00",
+  "verification_report": {
+    "checks": {
+      "checksums": true,
+      "financial": true,
+      "completeness": true,
+      "foreign_keys": true,
+      "record_counts": true
+    },
+    "passed": true,
+    "records": {
+      "orders": {
+        "source": 5000,
+        "target": 5000,
+        "matched": 5000,
+        "missing": 0,
+        "rejected": 0,
+        "unexpected": 0,
+        "quarantined": 0,
+        "invalid_source": 0,
+        "last_source_id": 5000,
+        "committed_records": 5000,
+        "checkpoint_matches": true,
+        "rejected_parent_references": 0,
+        "rejected_present_in_target": 0
+      },
+      "payments": {
+        "source": 5000,
+        "target": 5000,
+        "matched": 5000,
+        "missing": 0,
+        "rejected": 0,
+        "unexpected": 0,
+        "quarantined": 0,
+        "invalid_source": 0,
+        "last_source_id": 5000,
+        "committed_records": 5000,
+        "checkpoint_matches": true,
+        "rejected_parent_references": 0,
+        "rejected_present_in_target": 0
+      },
+      "customers": {
+        "source": 1000,
+        "target": 1000,
+        "matched": 1000,
+        "missing": 0,
+        "rejected": 0,
+        "unexpected": 0,
+        "quarantined": 0,
+        "invalid_source": 0,
+        "last_source_id": 1000,
+        "committed_records": 1000,
+        "checkpoint_matches": true,
+        "rejected_parent_references": 0,
+        "rejected_present_in_target": 0
+      },
+      "status_history": {
+        "source": 10000,
+        "target": 10000,
+        "matched": 10000,
+        "missing": 0,
+        "rejected": 0,
+        "unexpected": 0,
+        "quarantined": 0,
+        "invalid_source": 0,
+        "last_source_id": 10000,
+        "committed_records": 10000,
+        "checkpoint_matches": true,
+        "rejected_parent_references": 0,
+        "rejected_present_in_target": 0
+      }
+    },
+    "checksums": {
+      "orders": {
+        "matches": true,
+        "source_rows": 5000,
+        "target_rows": 5000,
+        "source_sha256": "259f9270eecabecf459f0e85e78eddd38968c94016c5a6546ac61b92193a9a59",
+        "target_sha256": "259f9270eecabecf459f0e85e78eddd38968c94016c5a6546ac61b92193a9a59"
+      },
+      "payments": {
+        "matches": true,
+        "source_rows": 5000,
+        "target_rows": 5000,
+        "source_sha256": "59cb959fcb7fb786a1752290166184a844fc6b21a46a38b389e365c17336cccd",
+        "target_sha256": "59cb959fcb7fb786a1752290166184a844fc6b21a46a38b389e365c17336cccd"
+      },
+      "addresses": {
+        "matches": true,
+        "source_rows": 1000,
+        "target_rows": 1000,
+        "source_sha256": "110b85503f820b6eb20bf445c166ed7527d3dba5da51627dbb540712332563ea",
+        "target_sha256": "110b85503f820b6eb20bf445c166ed7527d3dba5da51627dbb540712332563ea"
+      },
+      "customers": {
+        "matches": true,
+        "source_rows": 1000,
+        "target_rows": 1000,
+        "source_sha256": "db8598602e2eaf3286f3ff2a5747e18b30b0f9b1dd03dcff5cc9dff9fce3e3e7",
+        "target_sha256": "db8598602e2eaf3286f3ff2a5747e18b30b0f9b1dd03dcff5cc9dff9fce3e3e7"
+      },
+      "order_items": {
+        "matches": true,
+        "source_rows": 12569,
+        "target_rows": 12569,
+        "source_sha256": "76749dc52f5b184de2f86f0bdaccfb4d4b7aac250f05f4dc3b12ddde5225fa40",
+        "target_sha256": "76749dc52f5b184de2f86f0bdaccfb4d4b7aac250f05f4dc3b12ddde5225fa40"
+      },
+      "customer_contacts": {
+        "matches": true,
+        "source_rows": 1100,
+        "target_rows": 1100,
+        "source_sha256": "1b72ba72f106d8a37de240717a21875c46cea9785e0ef9e0566219329cad978f",
+        "target_sha256": "1b72ba72f106d8a37de240717a21875c46cea9785e0ef9e0566219329cad978f"
+      },
+      "customer_attributes": {
+        "matches": true,
+        "source_rows": 3000,
+        "target_rows": 3000,
+        "source_sha256": "aaccc69e27a90d19ccbafaf67cd82a04cf6ba0e94f03d3df4157582b13ecd947",
+        "target_sha256": "aaccc69e27a90d19ccbafaf67cd82a04cf6ba0e94f03d3df4157582b13ecd947"
+      },
+      "order_status_history": {
+        "matches": true,
+        "source_rows": 10000,
+        "target_rows": 10000,
+        "source_sha256": "ca90ab952734743f8f1b4bababd5b799ea3fbef8e75b069685ef5118f3ea78f7",
+        "target_sha256": "ca90ab952734743f8f1b4bababd5b799ea3fbef8e75b069685ef5118f3ea78f7"
+      }
+    },
+    "financial": {
+      "passed": true,
+      "value_mismatches": {
+        "orders": 0,
+        "payments": 0,
+        "order_items": 0
+      },
+      "totals_by_currency": {
+        "orders": {
+          "EUR": {
+            "source": "1585188.82",
+            "target": "1585188.82",
+            "difference": "0.00"
+          },
+          "GBP": {
+            "source": "1621864.03",
+            "target": "1621864.03",
+            "difference": "0.00"
+          },
+          "USD": {
+            "source": "1594865.29",
+            "target": "1594865.29",
+            "difference": "0.00"
+          }
+        },
+        "payments": {
+          "EUR": {
+            "source": "1585188.82",
+            "target": "1585188.82",
+            "difference": "0.00"
+          },
+          "GBP": {
+            "source": "1621864.03",
+            "target": "1621864.03",
+            "difference": "0.00"
+          },
+          "USD": {
+            "source": "1594865.29",
+            "target": "1594865.29",
+            "difference": "0.00"
+          }
+        },
+        "order_items": {
+          "EUR": {
+            "source": "1585188.82",
+            "target": "1585188.82",
+            "difference": "0.00"
+          },
+          "GBP": {
+            "source": "1621864.03",
+            "target": "1621864.03",
+            "difference": "0.00"
+          },
+          "USD": {
+            "source": "1594865.29",
+            "target": "1594865.29",
+            "difference": "0.00"
+          }
+        }
+      },
+      "invalid_line_totals": 0,
+      "invalid_order_totals": 0
+    },
+    "rejection_audit": {
+      "recorded": 0,
+      "matched_to_source": 0,
+      "invalid_quarantine_flags": 0
+    },
+    "duration_seconds": 5.959108,
+    "canonical_version": 1,
+    "run_counters_match": true,
+    "foreign_key_violations": {
+      "orders": 0,
+      "payments": 0,
+      "addresses": 0,
+      "order_items": 0,
+      "customer_contacts": 0,
+      "customer_attributes": 0,
+      "order_status_history": 0
+    }
+  },
+  "batches": {
+    "COMMITTED": 21
+  },
+  "checkpoints": [
+    {
+      "entity_type": "customers",
+      "last_legacy_id": 1000,
+      "records_processed": 1000,
+      "next_batch": 2
+    },
+    {
+      "entity_type": "orders",
+      "last_legacy_id": 5000,
+      "records_processed": 5000,
+      "next_batch": 6
+    },
+    {
+      "entity_type": "payments",
+      "last_legacy_id": 5000,
+      "records_processed": 5000,
+      "next_batch": 6
+    },
+    {
+      "entity_type": "status_history",
+      "last_legacy_id": 10000,
+      "records_processed": 10000,
+      "next_batch": 11
+    }
+  ],
+  "retry_count": 0,
+  "retries": [],
+  "errors": []
+}

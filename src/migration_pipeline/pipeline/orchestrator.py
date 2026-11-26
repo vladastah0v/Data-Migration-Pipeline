@@ -46,6 +46,7 @@ from migration_pipeline.pipeline.state import (
     finish_loading,
     reactivate_run,
     read_run,
+    save_peak_rss,
     save_retries,
 )
 from migration_pipeline.transformers.base import PARENT_KEYS, BatchReferences, transform_batch
@@ -91,10 +92,13 @@ class MigrationOrchestrator:
         settings: Settings,
         options: MigrationOptions,
         observer: MigrationObserver | None = None,
+        *,
+        peak_rss: Callable[[], int | None] | None = None,
     ) -> None:
         self.settings = settings
         self.options = options
         self.observer = observer
+        self.peak_rss = peak_rss
 
     async def run(self, *, expected_snapshot_id: UUID | None = None) -> RunState:
         sessions = self._sessions(expected_snapshot_id)
@@ -115,6 +119,7 @@ class MigrationOrchestrator:
                         run_id=execution.run_id,
                     )
                     await save_retries(target, execution.run_id, execution.pending)
+                    await self._save_peak(target, execution.run_id)
 
             await execution.attempt("create_run", start)
             execution.pending.clear()
@@ -165,6 +170,7 @@ class MigrationOrchestrator:
                         raise MigrationStateError("Конфигурация запуска изменилась.")
                     await reactivate_run(target, run_id)
                     await save_retries(target, run_id, execution.pending)
+                    await self._save_peak(target, run_id)
                     return None
 
             completed = await execution.attempt("resume_run", activate)
@@ -205,6 +211,7 @@ class MigrationOrchestrator:
             async with target.begin():
                 await lock_schema(target)
                 await save_retries(target, run_id, execution.pending)
+                await self._save_peak(target, run_id)
                 return await finish_loading(target, run_id)
 
         try:
@@ -252,7 +259,8 @@ class MigrationOrchestrator:
             raise
         except Exception as exc:
             message = _failure_message(exc)
-            audited = await _audit_failure(execution, message, active_batch, exc)
+            peak = self.peak_rss() if self.peak_rss is not None else None
+            audited = await _audit_failure(execution, message, active_batch, exc, peak)
             raise MigrationFailed(run_id, message, audited=audited) from exc
         self._emit("migration_loaded", **run_fields(result))
         return result
@@ -268,6 +276,7 @@ class MigrationOrchestrator:
             await lock_schema(target)
             if await batch_already_committed(target, run_id, batch):
                 await save_retries(target, run_id, execution.pending)
+                await self._save_peak(target, run_id)
                 return {**batch.log_fields(), "reconciled": True}
             references = await _target_references(target, run_id, batch)
             transform_started = perf_counter()
@@ -289,6 +298,7 @@ class MigrationOrchestrator:
             load_duration = perf_counter() - load_started
             await confirm_batch(target, run_id, batch, loaded, transformed.issues)
             await save_retries(target, run_id, execution.pending)
+            await self._save_peak(target, run_id)
         return {
             **batch.log_fields(),
             "records_inserted": loaded.inserted,
@@ -299,6 +309,10 @@ class MigrationOrchestrator:
             "load_duration_seconds": round(load_duration, 6),
             "transaction_duration_seconds": round(perf_counter() - started, 6),
         }
+
+    async def _save_peak(self, target: AsyncConnection, run_id: UUID) -> None:
+        if self.peak_rss is not None:
+            await save_peak_rss(target, run_id, self.peak_rss())
 
     def _emit(self, event: str, **fields: object) -> None:
         if self.observer is not None:
@@ -466,6 +480,7 @@ async def _audit_failure(
     message: str,
     active_batch: ExtractedBatch | None,
     exception: Exception,
+    peak: int | None,
 ) -> bool:
     issue = exception.issue if isinstance(exception, StrictTransformError) else None
     try:
@@ -476,6 +491,7 @@ async def _audit_failure(
             await lock_schema(connection)
             await save_retries(connection, execution.run_id, execution.pending)
             await fail_run(connection, execution.run_id, message, active_batch, issue)
+            await save_peak_rss(connection, execution.run_id, peak)
     except Exception:
         return False
     return True
