@@ -166,6 +166,16 @@ uv run --locked migration-pipeline benchmark --profile medium --repeats 3
 
 Отчёты `results.json`, `runs.csv` и `batches.csv` сохраняются в `benchmarks/<UUID>`. Доступны [методика бенчмарков](docs/benchmarking.md) и [фактические результаты Small](benchmarks/6fde1748-c887-4ba2-8776-da5a6887043b/results.json).
 
+## Мониторинг
+
+После `init` включите профиль `monitoring` для запуска отдельного exporter, Prometheus и Grafana.
+
+```bash
+docker compose --profile monitoring up -d --build metrics-exporter prometheus grafana
+```
+
+Grafana открывается на `http://localhost:3000`, Prometheus на `http://localhost:9090`. Дашборд «Миграция данных» загружается автоматически. Обычные команды миграции работают независимо от профиля. Семантика показателей, параметры подключения и отдельный запуск exporter описаны в [руководстве по мониторингу](docs/monitoring.md).
+
 ## Проверки
 
 ```bash

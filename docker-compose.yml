@@ -95,6 +95,48 @@ services:
     environment:
       <<: [*legacy-env, *legacy-admin-env]
 
+  metrics-exporter:
+    <<: *runner
+    profiles: [monitoring]
+    command: ["serve-metrics", "--host", "0.0.0.0"]
+    environment:
+      <<: *runner-env
+      TARGET_DB__USER: ${METRICS_TARGET_DB_USER:-${TARGET_DB__USER}}
+      TARGET_DB__PASSWORD: ${METRICS_TARGET_DB_PASSWORD:-${TARGET_DB__PASSWORD}}
+      DB_TIMEOUT_SECONDS: ${METRICS_DB_TIMEOUT_SECONDS:-4}
+    expose:
+      - "9108"
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    profiles: [monitoring]
+    depends_on:
+      - metrics-exporter
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:12.4.15
+    profiles: [monitoring]
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
 volumes:
   legacy-data:
   target-data:
+  prometheus-data:
+  grafana-data:

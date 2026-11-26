@@ -43,6 +43,7 @@ from migration_pipeline.extractors.base import (
 from migration_pipeline.extractors.base import DEFAULT_BATCH_SIZE as DEFAULT_EXTRACT_BATCH_SIZE
 from migration_pipeline.extractors.base import MAX_BATCH_SIZE as MAX_EXTRACT_BATCH_SIZE
 from migration_pipeline.loaders.base import ConflictPolicy, LoadStrategy
+from migration_pipeline.monitoring.exporter import serve_metrics as start_metrics_exporter
 from migration_pipeline.pipeline.orchestrator import (
     MigrationFailed,
     MigrationObserver,
@@ -674,6 +675,20 @@ def benchmark(
     if report["failure"]:
         error_console.print(Text(report["failure"], style="red"))
         raise typer.Exit(code=1)
+
+
+@app.command()
+def serve_metrics(
+    host: Annotated[str, typer.Option(help="Адрес прослушивания exporter.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(min=1, max=65535, help="Порт HTTP-метрик.")] = 9108,
+) -> None:
+    """Запустить отдельный exporter метрик Prometheus на базе аудита PostgreSQL."""
+    settings = _load_settings(Settings)
+    try:
+        start_metrics_exporter(settings, host, port)
+    except OSError as exc:
+        error_console.print(f"Не удалось открыть HTTP-порт exporter {host}:{port}.", style="red")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()
